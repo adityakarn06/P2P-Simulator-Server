@@ -394,6 +394,20 @@ describe("processMatchingJob — isolation and failures", () => {
     });
   });
 
+  it("excludes GENERATED invoices from the duplicate-number search", async () => {
+    // A GENERATED invoice (the PDFKit convenience document) shares its number
+    // with the uploaded document the operator re-uploads by design — the demo
+    // flow, not a duplicate. Only prior UPLOADED invoices can trip
+    // DUPLICATE_INVOICE, so the query itself must filter on source.
+    db.invoice.findFirst.mockResolvedValue(buildContext());
+
+    await processMatchingJob(buildJob());
+
+    expect(firstArg(db.invoice.findMany)).toMatchObject({
+      where: { source: "UPLOADED" },
+    });
+  });
+
   it("flags a duplicate invoice number", async () => {
     db.invoice.findFirst.mockResolvedValue(buildContext());
     db.invoice.findMany.mockResolvedValue([{ id: "inv-0", invoiceNumber: "INV-2026-0042" }]);
@@ -403,5 +417,15 @@ describe("processMatchingJob — isolation and failures", () => {
     expect(result.status).toBe("MISMATCHED");
     expect(exceptionTypes()).toContain("DUPLICATE_INVOICE");
     expect(enqueuePayment).not.toHaveBeenCalled();
+  });
+
+  it("never matches a GENERATED invoice, even if a stray job is delivered for one", async () => {
+    db.invoice.findFirst.mockResolvedValue({ ...buildContext(), source: "GENERATED" });
+
+    const result = await processMatchingJob(buildJob());
+
+    expect(result.skippedReason).toBe("Generated invoices are not matched");
+    expect(db.invoice.findMany).not.toHaveBeenCalled();
+    expect(exceptionTypes()).toEqual([]);
   });
 });

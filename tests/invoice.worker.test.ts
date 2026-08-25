@@ -130,6 +130,18 @@ beforeEach(() => {
 });
 
 describe("processInvoiceJob", () => {
+  it("never OCRs a GENERATED invoice, even if a stray job is delivered for one", async () => {
+    db.invoice.findFirst.mockResolvedValue(
+      loadedInvoice({ source: "GENERATED", status: "EXTRACTED" }),
+    );
+
+    const result = await processInvoiceJob(job());
+
+    expect(result.skippedReason).toBe("Generated invoices are not OCR'd");
+    expect(analyzeDocument).not.toHaveBeenCalled();
+    expect(enqueueMatching).not.toHaveBeenCalled();
+  });
+
   it("extracts the document and moves the invoice to EXTRACTED", async () => {
     const result = await processInvoiceJob(job());
 

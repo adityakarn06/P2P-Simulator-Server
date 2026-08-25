@@ -59,6 +59,19 @@ enum InvoiceStatus {
   FAILED
 }
 
+/**
+ * How an Invoice row came to exist. UPLOADED is the document three-way
+ * matching acts on. GENERATED is a PDFKit-rendered convenience document
+ * (src/services/invoice.service.ts generateInvoiceForPurchaseOrder) that never
+ * enters OCR or matching — see the source guards in the invoice and matching
+ * workers, and the source filter on loadPriorInvoices, which must exclude it so
+ * re-uploading a generated PDF cannot trip DUPLICATE_INVOICE against itself.
+ */
+enum InvoiceSource {
+  UPLOADED
+  GENERATED
+}
+
 enum PaymentStatus {
   PENDING
   PROCESSING
@@ -146,6 +159,7 @@ enum AuditAction {
   PAYMENT_APPROVED
   PAYMENT_COMPLETED
   WORKFLOW_FAILED
+  INVOICE_GENERATED
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +515,19 @@ model Invoice {
   purchaseOrderId String
   supplierId      String?
   status          InvoiceStatus @default(UPLOADED)
+  source          InvoiceSource @default(UPLOADED)
+
+  /**
+   * Set to purchaseOrderId only when source is GENERATED, null otherwise.
+   * Postgres treats every NULL as distinct under a UNIQUE constraint, so this
+   * enforces "at most one GENERATED invoice per purchase order" at the
+   * database level without limiting how many UPLOADED invoices a purchase
+   * order may have. generateInvoiceForPurchaseOrder in
+   * src/services/invoice.service.ts relies on the resulting unique-constraint
+   * violation to stay correct under two concurrent requests, not just its own
+   * upfront existence check.
+   */
+  generatedForPurchaseOrderId String? @unique
 
   fileUrl       String
   filePublicId  String
@@ -536,6 +563,7 @@ model Invoice {
   @@index([organizationId, status])
   @@index([organizationId, invoiceNumber])
   @@index([organizationId, normalizedInvoiceNumber])
+  @@index([organizationId, source])
   @@index([purchaseOrderId])
 }
 

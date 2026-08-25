@@ -1,7 +1,21 @@
 # Invoices API Reference (Frontend)
 
 How a client uploads a supplier invoice and watches it get read. See `architecture/invoices.md` for
-the backend design, and `api-docs/receipts-api.md` for the stage that precedes this.
+the backend design, `api-docs/receipts-api.md` for the stage that precedes this, and
+`api-docs/documents-api.md` for generating a demo invoice PDF instead of uploading a real one.
+
+## `Invoice.source`: GENERATED vs UPLOADED
+
+Every invoice carries `source`, either `UPLOADED` or `GENERATED`:
+
+- **`UPLOADED`** — a real document a client posted to `POST /invoices` below. This is the only kind
+  of invoice OCR reads and three-way matching acts on.
+- **`GENERATED`** — a PDFKit document rendered from the purchase order's own data by
+  `POST /purchase-orders/:id/generate-invoice` (see `api-docs/documents-api.md`). It exists purely
+  so a demo operator has something to download and re-upload; it is created straight at
+  `EXTRACTED` with real totals, is never sent to Gemini, and never enters matching. A purchase
+  order can therefore have **two** invoice rows: one `GENERATED` (convenience) and one `UPLOADED`
+  (the one that actually gets matched and paid). `GET /invoices` accepts `source` as a filter.
 
 Conventions (headers, envelope, error codes) are identical to the requisitions API — see
 `api-docs/requisitions-api.md`. Every request carries `x-organization-id`.
@@ -64,6 +78,7 @@ happened yet**:
       "purchaseOrderId": "po_xyz789",
       "supplierId": "sup_techsource",
       "status": "UPLOADED",
+      "source": "UPLOADED",
       "fileUrl": "https://res.cloudinary.com/.../authenticated/...",
       "fileMimeType": "application/pdf",
       "fileSizeBytes": 48213,
@@ -174,6 +189,7 @@ Cursor-paginated list, newest first.
 | Query param | Default | Notes |
 | --- | --- | --- |
 | `status` | — | Any `Invoice.status` value |
+| `source` | — | `UPLOADED` or `GENERATED` — see above |
 | `purchaseOrderId` | — | Invoices for one purchase order |
 | `limit` | `20` | Max `100` |
 | `cursor` | — | The `nextCursor` from the previous page |
@@ -209,6 +225,10 @@ Uploading a second invoice for the same purchase order is accepted, and so is th
 number twice. Detecting that is a three-way match check (`DUPLICATE_INVOICE`), not an upload-time
 refusal — the duplicate is meant to be recorded and flagged, not silently rejected. Don't build UI
 that assumes one invoice per purchase order.
+
+This check only looks at prior `UPLOADED` invoices. Uploading the same document a `GENERATED`
+invoice was rendered from — the intended demo flow — is expected to share its invoice number and
+does **not** trigger `DUPLICATE_INVOICE`.
 
 ## Not yet available
 

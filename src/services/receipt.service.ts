@@ -241,6 +241,55 @@ export async function listGoodsReceipts(params: {
 }
 
 // ---------------------------------------------------------------------------
+// PDF
+// ---------------------------------------------------------------------------
+
+const goodsReceiptForPdfSelect = {
+  id: true,
+  status: true,
+  receivedAt: true,
+  receivedBy: true,
+  notes: true,
+  organization: { select: { name: true } },
+  shipment: {
+    select: { trackingNumber: true, purchaseOrder: { select: { poNumber: true } } },
+  },
+  items: {
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: {
+      orderedQuantity: true,
+      receivedQuantity: true,
+      damagedQuantity: true,
+      acceptedQuantity: true,
+      // goodsReceiptViewSelect deliberately omits unit prices; the PDF needs a
+      // human-readable description, which only the purchase order line has.
+      purchaseOrderItem: { select: { description: true } },
+    },
+  },
+} satisfies Prisma.GoodsReceiptSelect;
+
+export type GoodsReceiptForPdf = Prisma.GoodsReceiptGetPayload<{
+  select: typeof goodsReceiptForPdfSelect;
+}>;
+
+/** Tenant-scoped read of everything the receipt PDF renderer needs — see src/pdf/documents/goodsReceipt.pdf.ts. */
+export async function loadGoodsReceiptForPdf(params: {
+  organizationId: string;
+  goodsReceiptId: string;
+}): Promise<GoodsReceiptForPdf> {
+  const goodsReceipt = await prisma.goodsReceipt.findFirst({
+    where: { id: params.goodsReceiptId, organizationId: params.organizationId },
+    select: goodsReceiptForPdfSelect,
+  });
+
+  if (!goodsReceipt) {
+    throw AppError.notFound("Goods receipt not found");
+  }
+
+  return goodsReceipt;
+}
+
+// ---------------------------------------------------------------------------
 // Goods receipt
 // ---------------------------------------------------------------------------
 

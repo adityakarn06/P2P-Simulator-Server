@@ -1,5 +1,10 @@
 import { Router } from "express";
-import { getInvoiceById, getInvoices, postInvoice } from "../controllers/invoice.controller.js";
+import {
+  getInvoiceById,
+  getInvoicePdf,
+  getInvoices,
+  postInvoice,
+} from "../controllers/invoice.controller.js";
 import { uploadInvoiceFile } from "../middleware/upload.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 
@@ -9,3 +14,4 @@ export const invoiceRouter: Router = Router();
 invoiceRouter.post("/", uploadInvoiceFile, asyncHandler(postInvoice));
 invoiceRouter.get("/", asyncHandler(getInvoices));
 invoiceRouter.get("/:id", asyncHandler(getInvoiceById));
+invoiceRouter.get("/:id/pdf", asyncHandler(getInvoicePdf));

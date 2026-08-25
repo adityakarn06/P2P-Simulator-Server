@@ -3,17 +3,27 @@ import { prisma } from "../config/prisma.js";
 import type { Prisma } from "../generated/prisma/client.js";
 import {
   ExceptionType,
+  InvoiceSource,
   InvoiceStatus,
   PurchaseOrderStatus,
   Severity,
 } from "../generated/prisma/enums.js";
+import { renderInvoicePdf } from "../pdf/documents/invoice.pdf.js";
+import {
+  buildGeneratedInvoiceLines,
+  buildGeneratedInvoiceNumber,
+  computeGeneratedInvoiceTotals,
+  type GeneratedInvoiceLineOverride,
+} from "../rules/generatedInvoice.js";
 import { getStorageProvider } from "../storage/index.js";
 import { AppError } from "../utils/AppError.js";
+import { isUniqueViolation } from "../utils/prismaErrors.js";
 import type { InvoiceExtraction } from "../zod/invoice.schema.js";
 import { toInvoiceDate, toPaise } from "../zod/invoice.schema.js";
 import { INVOICE_ENTITY, recordAudit } from "./audit.service.js";
 import { recordException } from "./exception.service.js";
 import { normalizeInvoiceNumber } from "./matching.service.js";
+import { loadPurchaseOrderForDocuments } from "./purchaseOrder.service.js";
 
 /**
  * Purchase-order statuses an invoice may be raised against. A DRAFT,
@@ -46,6 +56,7 @@ export const invoiceViewSelect = {
   purchaseOrderId: true,
   supplierId: true,
   status: true,
+  source: true,
   fileUrl: true,
   fileMimeType: true,
   fileSizeBytes: true,
@@ -100,19 +111,44 @@ export async function getInvoice(params: {
   return invoice;
 }
 
+const invoiceFileSelect = {
+  id: true,
+  filePublicId: true,
+  fileMimeType: true,
+} satisfies Prisma.InvoiceSelect;
+
+/** Tenant-scoped lookup of just what GET /invoices/:id/pdf needs to stream the stored bytes back. */
+export async function getInvoiceFile(params: {
+  organizationId: string;
+  invoiceId: string;
+}): Promise<Prisma.InvoiceGetPayload<{ select: typeof invoiceFileSelect }>> {
+  const invoice = await prisma.invoice.findFirst({
+    where: { id: params.invoiceId, organizationId: params.organizationId },
+    select: invoiceFileSelect,
+  });
+
+  if (!invoice) {
+    throw AppError.notFound("Invoice not found");
+  }
+
+  return invoice;
+}
+
 export async function listInvoices(params: {
   organizationId: string;
   status?: InvoiceStatus;
+  source?: InvoiceSource;
   purchaseOrderId?: string;
   limit: number;
   cursor?: string;
 }): Promise<{ items: InvoiceView[]; nextCursor: string | null }> {
-  const { organizationId, status, purchaseOrderId, limit, cursor } = params;
+  const { organizationId, status, source, purchaseOrderId, limit, cursor } = params;
 
   const items = await prisma.invoice.findMany({
     where: {
       organizationId,
       ...(status ? { status } : {}),
+      ...(source ? { source } : {}),
       ...(purchaseOrderId ? { purchaseOrderId } : {}),
     },
     select: invoiceViewSelect,
@@ -236,6 +272,191 @@ export async function createInvoice(params: CreateInvoiceParams): Promise<Invoic
 }
 
 // ---------------------------------------------------------------------------
+// Generation (PDFKit convenience document, never OCR'd)
+// ---------------------------------------------------------------------------
+
+export interface GenerateInvoiceParams {
+  organizationId: string;
+  actorId?: string | null;
+  purchaseOrderId: string;
+  items?: GeneratedInvoiceLineOverride[];
+}
+
+export interface GenerateInvoiceResult {
+  invoice: InvoiceView;
+  /** False when a generated invoice already existed for this PO — the caller answers 200, not 201. */
+  created: boolean;
+}
+
+/**
+ * Renders a PDFKit invoice from the purchase order's own data and stores it as
+ * an Invoice row with source: GENERATED.
+ *
+ * This is a convenience document for the demo operator, never the document
+ * three-way matching acts on (CLAUDE.md §9: AI/OCR is the only path onto a
+ * payable invoice). It is created straight at EXTRACTED with real totals, no
+ * queue job is enqueued, and a second call is idempotent — it returns the
+ * invoice already on file for this PO rather than rendering a duplicate.
+ *
+ * Idempotency has two layers: the upfront lookup below answers instantly on
+ * an ordinary repeat call once the first has committed, but two *concurrent*
+ * calls can both pass that check before either commits. The real guard is
+ * Invoice.generatedForPurchaseOrderId @unique (schema.prisma) — the loser's
+ * insert fails with a unique-constraint violation, caught below, which
+ * deletes its now-orphaned upload and returns the winner's row instead of
+ * erroring or leaving two GENERATED invoices on one purchase order.
+ */
+export async function generateInvoiceForPurchaseOrder(
+  params: GenerateInvoiceParams,
+): Promise<GenerateInvoiceResult> {
+  const { organizationId, purchaseOrderId } = params;
+
+  // Independent reads — run them together rather than one after the other.
+  const [purchaseOrder, existing] = await Promise.all([
+    loadPurchaseOrderForDocuments({ organizationId, purchaseOrderId }),
+    prisma.invoice.findFirst({
+      where: { organizationId, purchaseOrderId, source: InvoiceSource.GENERATED },
+      select: invoiceViewSelect,
+    }),
+  ]);
+
+  if (!INVOICEABLE_PO_STATUSES.includes(purchaseOrder.status)) {
+    throw AppError.invalidState(`A ${purchaseOrder.status} purchase order cannot be invoiced`, {
+      purchaseOrderStatus: purchaseOrder.status,
+    });
+  }
+
+  if (existing) {
+    return { invoice: existing, created: false };
+  }
+
+  const lines = buildGeneratedInvoiceLines(
+    purchaseOrder.items.map((item) => ({
+      purchaseOrderItemId: item.id,
+      productId: item.productId,
+      description: item.description,
+      quantity: item.quantity,
+      unitPricePaise: item.unitPricePaise,
+    })),
+    params.items,
+  );
+  const totals = computeGeneratedInvoiceTotals(lines, purchaseOrder.taxRateBps);
+
+  const invoiceNumber = buildGeneratedInvoiceNumber(purchaseOrder.poNumber);
+  const invoiceDate = new Date();
+
+  const pdf = await renderInvoicePdf({
+    invoiceNumber,
+    invoiceDate,
+    poNumber: purchaseOrder.poNumber,
+    currency: purchaseOrder.currency,
+    subtotalPaise: totals.subtotalPaise,
+    taxPaise: totals.taxPaise,
+    totalPaise: totals.totalPaise,
+    supplier: purchaseOrder.supplier,
+    billTo: { organizationName: purchaseOrder.organization.name },
+    items: lines,
+  });
+
+  const invoiceId = randomUUID();
+
+  // Same ordering as createInvoice: fileUrl/filePublicId are non-nullable, so
+  // the document is stored before the row exists.
+  const uploaded = await getStorageProvider().upload({
+    invoiceId,
+    fileName: `${invoiceNumber}.pdf`,
+    buffer: pdf,
+    mimeType: "application/pdf",
+  });
+
+  try {
+    const invoice = await prisma.$transaction(async (tx) => {
+      const created = await tx.invoice.create({
+        data: {
+          id: invoiceId,
+          organizationId,
+          purchaseOrderId: purchaseOrder.id,
+          supplierId: purchaseOrder.supplierId,
+          status: InvoiceStatus.EXTRACTED,
+          source: InvoiceSource.GENERATED,
+          generatedForPurchaseOrderId: purchaseOrder.id,
+          fileUrl: uploaded.url,
+          filePublicId: uploaded.storageKey,
+          fileMimeType: "application/pdf",
+          fileSizeBytes: uploaded.bytes,
+          invoiceNumber,
+          normalizedInvoiceNumber: normalizeInvoiceNumber(invoiceNumber),
+          invoiceDate,
+          supplierNameRaw: purchaseOrder.supplier.name,
+          poNumberRaw: purchaseOrder.poNumber,
+          subtotalPaise: totals.subtotalPaise,
+          taxPaise: totals.taxPaise,
+          totalPaise: totals.totalPaise,
+          currency: purchaseOrder.currency,
+          extractedAt: invoiceDate,
+          items: {
+            create: lines.map((line, index) => ({
+              lineNumber: index + 1,
+              description: line.description,
+              quantity: line.quantity,
+              unitPricePaise: line.unitPricePaise,
+              lineTotalPaise: line.lineTotalPaise,
+              productId: line.productId,
+            })),
+          },
+        },
+        select: invoiceViewSelect,
+      });
+
+      await recordAudit(tx, {
+        organizationId,
+        actorType: "USER",
+        actorId: params.actorId ?? null,
+        action: "INVOICE_GENERATED",
+        entityType: INVOICE_ENTITY,
+        entityId: created.id,
+        metadata: {
+          purchaseOrderId: purchaseOrder.id,
+          invoiceNumber,
+          totalPaise: totals.totalPaise,
+        },
+      });
+
+      return created;
+    });
+
+    return { invoice, created: true };
+  } catch (error) {
+    // Best-effort cleanup: the upload succeeded but nothing references it now,
+    // whether this is the ordinary failure path or the race described above.
+    try {
+      await getStorageProvider().delete(uploaded.storageKey);
+    } catch (cleanupError) {
+      console.error(
+        `Failed to remove orphaned Cloudinary object ${uploaded.storageKey}:`,
+        cleanupError,
+      );
+    }
+
+    if (isUniqueViolation(error)) {
+      // Lost the race on generatedForPurchaseOrderId @unique: a concurrent
+      // call already committed a GENERATED invoice for this PO. Its row is
+      // the correct answer, not an error.
+      const winner = await prisma.invoice.findFirst({
+        where: { organizationId, purchaseOrderId, source: InvoiceSource.GENERATED },
+        select: invoiceViewSelect,
+      });
+
+      if (winner) {
+        return { invoice: winner, created: false };
+      }
+    }
+
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Worker: load, claim, apply
 // ---------------------------------------------------------------------------
 
@@ -243,6 +464,7 @@ const invoiceForProcessingSelect = {
   id: true,
   organizationId: true,
   status: true,
+  source: true,
   filePublicId: true,
   fileMimeType: true,
   extractionAttempts: true,

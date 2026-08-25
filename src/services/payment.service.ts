@@ -8,6 +8,7 @@ import {
 } from "../generated/prisma/enums.js";
 import { PAYMENT_PROVIDER_NAME } from "../payments/index.js";
 import { AppError } from "../utils/AppError.js";
+import { isUniqueViolation } from "../utils/prismaErrors.js";
 import { INVOICE_ENTITY, recordAudit } from "./audit.service.js";
 import { recordException } from "./exception.service.js";
 
@@ -146,13 +147,6 @@ function recordPaymentApproved(params: {
     entityId: params.invoiceId,
     metadata: { amountPaise: params.amountPaise, currency: params.currency },
   });
-}
-
-/** Prisma's unique-constraint error, without importing the runtime error class. */
-function isUniqueViolation(error: unknown): boolean {
-  return (
-    typeof error === "object" && error !== null && (error as { code?: unknown }).code === "P2002"
-  );
 }
 
 // ---------------------------------------------------------------------------

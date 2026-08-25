@@ -5,6 +5,10 @@ export const shipmentIdParamSchema = z.object({
   id: z.string().min(1),
 });
 
+export const goodsReceiptIdParamSchema = z.object({
+  id: z.string().min(1),
+});
+
 export const listShipmentsQuerySchema = z.object({
   status: z.enum(ShipmentStatus).optional(),
   purchaseOrderId: z.string().min(1).optional(),

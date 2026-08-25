@@ -1,5 +1,5 @@
 import type { Job } from "bullmq";
-import { InvoiceStatus, MatchStatus } from "../generated/prisma/enums.js";
+import { InvoiceSource, InvoiceStatus, MatchStatus } from "../generated/prisma/enums.js";
 import { MATCHING_JOBS } from "../queues/matching.queue.js";
 import { enqueuePayment } from "../queues/payment.queue.js";
 import { threeWayMatch } from "../rules/threeWayMatch.js";
@@ -48,6 +48,16 @@ export async function processMatchingJob(job: Job): Promise<MatchingResult> {
 
   try {
     const context = await loadMatchingContext({ organizationId, invoiceId });
+
+    // Same guard as the invoice worker: a GENERATED invoice never enters
+    // matching. Nothing enqueues one, but a stray job must still no-op.
+    if (context.source === InvoiceSource.GENERATED) {
+      return {
+        invoiceId,
+        status: null,
+        skippedReason: "Generated invoices are not matched",
+      };
+    }
 
     // Idempotency: a match already exists, so this is a re-delivery.
     if (context.threeWayMatch) {

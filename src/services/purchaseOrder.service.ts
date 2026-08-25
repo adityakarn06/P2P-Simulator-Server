@@ -514,6 +514,69 @@ export async function listPurchaseOrders(params: {
 }
 
 // ---------------------------------------------------------------------------
+// Documents (PDF rendering and generated-invoice creation)
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared by the PO PDF renderer (src/pdf/documents/purchaseOrder.pdf.ts) and
+ * generateInvoiceForPurchaseOrder (src/services/invoice.service.ts) — both
+ * need the same supplier contact block and item lines, so one select and one
+ * loader serve both rather than drifting apart as two near-identical copies.
+ */
+const purchaseOrderForDocumentsSelect = {
+  id: true,
+  poNumber: true,
+  status: true,
+  currency: true,
+  taxRateBps: true,
+  supplierId: true,
+  subtotalPaise: true,
+  taxPaise: true,
+  totalPaise: true,
+  expectedDeliveryDate: true,
+  approvedAt: true,
+  approvedBy: true,
+  createdAt: true,
+  organization: { select: { name: true } },
+  supplier: { select: { name: true, email: true, phone: true } },
+  items: {
+    // createdAt alone does not order nested-created rows deterministically —
+    // they can share one timestamp — so id breaks the tie, same as
+    // goodsReceiptViewSelect in src/services/receipt.service.ts.
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    select: {
+      id: true,
+      productId: true,
+      description: true,
+      quantity: true,
+      unitPricePaise: true,
+      lineTotalPaise: true,
+    },
+  },
+} satisfies Prisma.PurchaseOrderSelect;
+
+export type PurchaseOrderForDocuments = Prisma.PurchaseOrderGetPayload<{
+  select: typeof purchaseOrderForDocumentsSelect;
+}>;
+
+/** Tenant-scoped read of everything the PO PDF renderer and generated-invoice creation need. */
+export async function loadPurchaseOrderForDocuments(params: {
+  organizationId: string;
+  purchaseOrderId: string;
+}): Promise<PurchaseOrderForDocuments> {
+  const purchaseOrder = await prisma.purchaseOrder.findFirst({
+    where: { id: params.purchaseOrderId, organizationId: params.organizationId },
+    select: purchaseOrderForDocumentsSelect,
+  });
+
+  if (!purchaseOrder) {
+    throw AppError.notFound("Purchase order not found");
+  }
+
+  return purchaseOrder;
+}
+
+// ---------------------------------------------------------------------------
 // Approval / rejection
 // ---------------------------------------------------------------------------
 

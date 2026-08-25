@@ -2,6 +2,7 @@ import { prisma } from "../config/prisma.js";
 import type { Prisma } from "../generated/prisma/client.js";
 import {
   ExceptionType,
+  InvoiceSource,
   InvoiceStatus,
   type MatchCheckType,
   MatchStatus,
@@ -36,6 +37,7 @@ const matchingContextSelect = {
   id: true,
   organizationId: true,
   status: true,
+  source: true,
   invoiceNumber: true,
   supplierNameRaw: true,
   poNumberRaw: true,
@@ -156,6 +158,11 @@ export function loadPriorInvoices(params: {
       organizationId: params.organizationId,
       id: { not: params.invoiceId },
       normalizedInvoiceNumber: normalized,
+      // A GENERATED invoice (the PDFKit convenience document) is expected to
+      // share its number with the uploaded document the operator re-uploads —
+      // that is the intended demo flow, not a duplicate. Only prior UPLOADED
+      // invoices can trigger DUPLICATE_INVOICE.
+      source: InvoiceSource.UPLOADED,
     },
     select: { id: true, invoiceNumber: true },
   });

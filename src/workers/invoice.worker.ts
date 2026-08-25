@@ -1,7 +1,7 @@
 import type { Job } from "bullmq";
 import { AI_MODEL, getAIProvider } from "../ai/index.js";
 import { INVOICE_PROMPT_VERSION, INVOICE_SYSTEM_PROMPT } from "../ai/prompts/invoice.v1.js";
-import { InvoiceStatus } from "../generated/prisma/enums.js";
+import { InvoiceSource, InvoiceStatus } from "../generated/prisma/enums.js";
 import { INVOICE_JOBS } from "../queues/invoice.queue.js";
 import { enqueueMatching } from "../queues/matching.queue.js";
 import { recordAIProcessing } from "../services/aiLog.service.js";
@@ -39,6 +39,14 @@ export async function processInvoiceJob(job: Job): Promise<InvoiceProcessingResu
   const { invoiceId, organizationId } = invoiceJobSchema.parse(job.data);
 
   const invoice = await loadInvoiceForProcessing({ organizationId, invoiceId });
+
+  // A GENERATED invoice (src/services/invoice.service.ts generateInvoiceForPurchaseOrder)
+  // is created straight at EXTRACTED with real totals and never queued in the
+  // first place. This guard exists only in case a stray job is ever delivered
+  // for one — it must never be sent to Gemini or have matching enqueued for it.
+  if (invoice.source === InvoiceSource.GENERATED) {
+    return { invoiceId, status: invoice.status, skippedReason: "Generated invoices are not OCR'd" };
+  }
 
   // Idempotency: BullMQ may run a job more than once. Once a document has been
   // read, never send it to Gemini again.

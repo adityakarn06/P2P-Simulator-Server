@@ -1,7 +1,15 @@
 import type { Request, Response } from "express";
 import { enqueueInvoice } from "../queues/invoice.queue.js";
-import { createInvoice, getInvoice, listInvoices } from "../services/invoice.service.js";
+import {
+  createInvoice,
+  getInvoice,
+  getInvoiceFile,
+  listInvoices,
+} from "../services/invoice.service.js";
+import { getStorageProvider } from "../storage/index.js";
+import { FORMAT_BY_MIME_TYPE } from "../storage/storage.interface.js";
 import { AppError } from "../utils/AppError.js";
+import { sendFile } from "../utils/fileResponse.js";
 import { sendSuccess } from "../utils/response.js";
 import {
   createInvoiceSchema,
@@ -56,4 +64,22 @@ export async function getInvoices(req: Request, res: Response): Promise<void> {
   const query = listInvoicesQuerySchema.parse(req.query);
 
   sendSuccess(res, await listInvoices({ organizationId, ...query }));
+}
+
+/**
+ * Streams the invoice document's stored bytes back as a download — the same
+ * route works for a GENERATED invoice (always a PDF) and an UPLOADED one
+ * (PDF, PNG or JPEG), so the content type and extension follow the file's own
+ * stored MIME type rather than being hardcoded to application/pdf.
+ */
+export async function getInvoicePdf(req: Request, res: Response): Promise<void> {
+  const { organizationId } = requireTenant(req);
+  const { id } = invoiceIdParamSchema.parse(req.params);
+
+  const invoice = await getInvoiceFile({ organizationId, invoiceId: id });
+  const buffer = await getStorageProvider().download(invoice.filePublicId, invoice.fileMimeType);
+  const format =
+    FORMAT_BY_MIME_TYPE[invoice.fileMimeType as keyof typeof FORMAT_BY_MIME_TYPE] ?? "bin";
+
+  sendFile(res, buffer, invoice.fileMimeType, `invoice-${invoice.id}.${format}`);
 }

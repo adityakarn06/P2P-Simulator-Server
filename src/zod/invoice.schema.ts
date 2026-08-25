@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { InvoiceStatus } from "../generated/prisma/enums.js";
+import { InvoiceSource, InvoiceStatus } from "../generated/prisma/enums.js";
 
 // ---------------------------------------------------------------------------
 // API input
@@ -20,6 +20,7 @@ export const invoiceIdParamSchema = z.object({
 
 export const listInvoicesQuerySchema = z.object({
   status: z.enum(InvoiceStatus).optional(),
+  source: z.enum(InvoiceSource).optional(),
   purchaseOrderId: z.string().min(1).optional(),
   limit: z.coerce.number().int().positive().max(100).default(20),
   cursor: z.string().min(1).optional(),
