@@ -1,8 +1,8 @@
-# Shipments and Goods Receipts API Reference (Frontend)
+# Goods Receipts API Reference (Frontend)
 
-How a client reads a shipment and simulates its delivery. See `architecture/goods-receipt.md` for
-the backend design, `api-docs/purchase-orders-api.md` for the stage that precedes this, and
-`api-docs/invoices-api.md` for the one that follows.
+How a client simulates a shipment's delivery and reads back the goods receipts it created. See
+`architecture/goods-receipt.md` for the backend design, `api-docs/shipments-api.md` for reading and
+listing shipments themselves, and `api-docs/invoices-api.md` for the stage that follows.
 
 Conventions (headers, envelope, error codes) are identical to the requisitions API — see
 `api-docs/requisitions-api.md`. Every request carries `x-organization-id`.
@@ -10,45 +10,17 @@ Conventions (headers, envelope, error codes) are identical to the requisitions A
 ## The stage in one picture
 
 ```text
-POST /purchase-orders/:id/approve  ──▶ PO APPROVED + shipment IN_TRANSIT
-        │
-        ▼
-GET /shipments/:id                 ──▶ status IN_TRANSIT, goodsReceipt null
+GET /shipments/:id                 (see shipments-api.md) ──▶ status IN_TRANSIT, goodsReceipt null
         │
         ▼
 POST /receipts/simulate            ──▶ shipment DELIVERED, PO RECEIVED, GoodsReceipt created
+GET /receipts                      ──▶ list, newest first
         │
         ▼
 POST /invoices                     (next stage — see invoices-api.md)
 ```
 
 The shipment id comes from `GET /purchase-orders/:id`, which returns `{ purchaseOrder, shipment }`.
-
-## GET /api/v1/shipments/:id
-
-```json
-{
-  "success": true,
-  "data": {
-    "shipment": {
-      "id": "ship_123",
-      "purchaseOrderId": "po_xyz789",
-      "trackingNumber": "TRK-0000000ABCDEFG",
-      "carrier": null,
-      "status": "IN_TRANSIT",
-      "shippedAt": "2026-08-24T09:00:00.000Z",
-      "deliveredAt": null,
-      "expectedDeliveryDate": "2026-08-29T00:00:00.000Z",
-      "createdAt": "2026-08-24T09:00:00.000Z"
-    },
-    "goodsReceipt": null
-  },
-  "error": null
-}
-```
-
-`goodsReceipt` is `null` until the delivery is recorded, and then carries the same shape as the
-receipt returned below. A shipment belonging to another organization is a `404`.
 
 ## POST /api/v1/receipts/simulate
 
@@ -139,3 +111,40 @@ matching exception for a human to resolve.
 | 404 | `NOT_FOUND` | Unknown shipment, or one owned by another organization |
 | 409 | `INVALID_STATE` | Shipment still `CREATED`; purchase order not `APPROVED`/`SHIPPED`; shipment `DELIVERED` with no receipt (corrupt state, reported rather than repaired) |
 | 409 | `CONFLICT` | A concurrent delivery claimed the shipment first, or a replay reported quantities different from the receipt on file (`details` carries `recorded` vs `submitted`) |
+
+## GET /api/v1/receipts
+
+Query: `status` (any `GoodsReceiptStatus`: `PENDING` | `PARTIAL` | `COMPLETED`), `purchaseOrderId`,
+`shipmentId`, `limit` (1–100, default 20), `cursor`.
+
+```json
+{
+  "success": true,
+  "data": {
+    "items": [
+      {
+        "id": "gr_456",
+        "purchaseOrderId": "po_xyz789",
+        "poNumber": "PO-20260824-K3F9QZ0V8B2M",
+        "shipmentId": "ship_123",
+        "status": "PARTIAL",
+        "receivedAt": "2026-08-26T10:00:00.000Z",
+        "receivedBy": "dev-user",
+        "createdAt": "2026-08-26T10:00:00.000Z"
+      }
+    ],
+    "nextCursor": null
+  },
+  "error": null
+}
+```
+
+Newest first. Pass `nextCursor` back as `cursor` for the following page. Rows are **summary only** —
+no `items[]`. For the line-item breakdown of a receipt, use `GET /shipments/:id`, whose
+`goodsReceipt.items` carries the full per-line quantities documented above.
+
+### Errors
+
+| Status | Code | When |
+| --- | --- | --- |
+| 400 | `VALIDATION_ERROR` | Unknown `status`, or `limit` out of range |

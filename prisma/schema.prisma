@@ -447,6 +447,7 @@ model Shipment {
 
   @@unique([organizationId, trackingNumber])
   @@index([organizationId])
+  @@index([organizationId, status])
 }
 
 model GoodsReceipt {

@@ -1,8 +1,26 @@
 import { z } from "zod";
+import { GoodsReceiptStatus, ShipmentStatus } from "../generated/prisma/enums.js";
 
 export const shipmentIdParamSchema = z.object({
   id: z.string().min(1),
 });
+
+export const listShipmentsQuerySchema = z.object({
+  status: z.enum(ShipmentStatus).optional(),
+  purchaseOrderId: z.string().min(1).optional(),
+  limit: z.coerce.number().int().positive().max(100).default(20),
+  cursor: z.string().min(1).optional(),
+});
+export type ListShipmentsQuery = z.infer<typeof listShipmentsQuerySchema>;
+
+export const listGoodsReceiptsQuerySchema = z.object({
+  status: z.enum(GoodsReceiptStatus).optional(),
+  purchaseOrderId: z.string().min(1).optional(),
+  shipmentId: z.string().min(1).optional(),
+  limit: z.coerce.number().int().positive().max(100).default(20),
+  cursor: z.string().min(1).optional(),
+});
+export type ListGoodsReceiptsQuery = z.infer<typeof listGoodsReceiptsQuerySchema>;
 
 /**
  * One physically received purchase-order line. `damagedQuantity` is a subset of

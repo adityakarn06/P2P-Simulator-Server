@@ -1,14 +1,21 @@
 import type { Request, Response } from "express";
-import { recordGoodsReceipt } from "../services/receipt.service.js";
+import { listGoodsReceipts, recordGoodsReceipt } from "../services/receipt.service.js";
 import { AppError } from "../utils/AppError.js";
 import { sendSuccess } from "../utils/response.js";
-import { simulateReceiptSchema } from "../zod/receipt.schema.js";
+import { listGoodsReceiptsQuerySchema, simulateReceiptSchema } from "../zod/receipt.schema.js";
 
 function requireTenant(req: Request): { organizationId: string; userId: string } {
   if (!req.auth) {
     throw AppError.unauthorized();
   }
   return { organizationId: req.auth.organizationId, userId: req.auth.userId };
+}
+
+export async function getGoodsReceipts(req: Request, res: Response): Promise<void> {
+  const { organizationId } = requireTenant(req);
+  const query = listGoodsReceiptsQuerySchema.parse(req.query);
+
+  sendSuccess(res, await listGoodsReceipts({ organizationId, ...query }));
 }
 
 /**

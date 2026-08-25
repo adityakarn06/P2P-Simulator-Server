@@ -1,6 +1,6 @@
 import { prisma } from "../config/prisma.js";
 import type { Prisma } from "../generated/prisma/client.js";
-import type { ActorType } from "../generated/prisma/enums.js";
+import type { ActorType, GoodsReceiptStatus } from "../generated/prisma/enums.js";
 import { PurchaseOrderStatus, ShipmentStatus } from "../generated/prisma/enums.js";
 import {
   buildReceiptLines,
@@ -122,6 +122,122 @@ export async function getShipment(params: {
 }): Promise<ShipmentWithReceipt> {
   const shipment = await findShipment(params);
   return { shipment: toShipmentView(shipment), goodsReceipt: shipment.goodsReceipt };
+}
+
+// ---------------------------------------------------------------------------
+// Lists
+// ---------------------------------------------------------------------------
+
+// GoodsReceipt has no `purchaseOrder` relation of its own, only the scalar
+// purchaseOrderId — but every shipment carries exactly one purchase order, so
+// poNumber is reached through the shipment instead.
+const shipmentListSelect = {
+  ...shipmentViewSelect,
+  purchaseOrder: { select: { poNumber: true } },
+} satisfies Prisma.ShipmentSelect;
+
+type ShipmentListRow = Prisma.ShipmentGetPayload<{ select: typeof shipmentListSelect }>;
+
+export interface ShipmentListItem extends ShipmentView {
+  poNumber: string;
+}
+
+function toShipmentListItem(row: ShipmentListRow): ShipmentListItem {
+  const { purchaseOrder, ...view } = row;
+  return { ...view, poNumber: purchaseOrder.poNumber };
+}
+
+export async function listShipments(params: {
+  organizationId: string;
+  status?: ShipmentStatus;
+  purchaseOrderId?: string;
+  limit: number;
+  cursor?: string;
+}) {
+  const { organizationId, status, purchaseOrderId, limit, cursor } = params;
+
+  const rows = await prisma.shipment.findMany({
+    where: {
+      organizationId,
+      ...(status ? { status } : {}),
+      ...(purchaseOrderId ? { purchaseOrderId } : {}),
+    },
+    select: shipmentListSelect,
+    // createdAt alone is not unique, so a page boundary landing inside a tie
+    // could repeat or skip rows; id breaks the tie deterministically.
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: limit + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+  });
+
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+
+  return {
+    items: page.map(toShipmentListItem),
+    nextCursor: hasMore ? (page[page.length - 1]?.id ?? null) : null,
+  };
+}
+
+const goodsReceiptListSelect = {
+  id: true,
+  purchaseOrderId: true,
+  shipmentId: true,
+  status: true,
+  receivedAt: true,
+  receivedBy: true,
+  createdAt: true,
+  shipment: { select: { purchaseOrder: { select: { poNumber: true } } } },
+} satisfies Prisma.GoodsReceiptSelect;
+
+type GoodsReceiptListRow = Prisma.GoodsReceiptGetPayload<{ select: typeof goodsReceiptListSelect }>;
+
+export interface GoodsReceiptListItem {
+  id: string;
+  purchaseOrderId: string;
+  poNumber: string;
+  shipmentId: string;
+  status: GoodsReceiptStatus;
+  receivedAt: Date;
+  receivedBy: string | null;
+  createdAt: Date;
+}
+
+function toGoodsReceiptListItem(row: GoodsReceiptListRow): GoodsReceiptListItem {
+  const { shipment, ...rest } = row;
+  return { ...rest, poNumber: shipment.purchaseOrder.poNumber };
+}
+
+export async function listGoodsReceipts(params: {
+  organizationId: string;
+  status?: GoodsReceiptStatus;
+  purchaseOrderId?: string;
+  shipmentId?: string;
+  limit: number;
+  cursor?: string;
+}) {
+  const { organizationId, status, purchaseOrderId, shipmentId, limit, cursor } = params;
+
+  const rows = await prisma.goodsReceipt.findMany({
+    where: {
+      organizationId,
+      ...(status ? { status } : {}),
+      ...(purchaseOrderId ? { purchaseOrderId } : {}),
+      ...(shipmentId ? { shipmentId } : {}),
+    },
+    select: goodsReceiptListSelect,
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: limit + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+  });
+
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+
+  return {
+    items: page.map(toGoodsReceiptListItem),
+    nextCursor: hasMore ? (page[page.length - 1]?.id ?? null) : null,
+  };
 }
 
 // ---------------------------------------------------------------------------

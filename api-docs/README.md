@@ -9,7 +9,7 @@ is `/api/v1` (e.g. `POST /api/v1/requisitions`).
 | 1. Requisition intake (chat) | [`requisitions-api.md`](./requisitions-api.md) | `POST /requisitions`, `POST /requisitions/:id/messages`, `GET /requisitions/:id`, `GET /requisitions` |
 | 2. Supplier discovery | [`sourcing-api.md`](./sourcing-api.md) | none — read through `GET /requisitions/:id` |
 | 3. Purchase order | [`purchase-orders-api.md`](./purchase-orders-api.md) | `POST /purchase-orders/:id/approve`, `POST /purchase-orders/:id/reject`, `GET /purchase-orders/:id`, `GET /purchase-orders` |
-| 4. Shipment & goods receipt | [`receipts-api.md`](./receipts-api.md) | `GET /shipments/:id`, `POST /receipts/simulate` |
+| 4. Shipment & goods receipt | [`shipments-api.md`](./shipments-api.md), [`receipts-api.md`](./receipts-api.md) | `GET /shipments`, `GET /shipments/:id`, `POST /receipts/simulate`, `GET /receipts` |
 | 5. Invoice upload & extraction | [`invoices-api.md`](./invoices-api.md) | `POST /invoices`, `GET /invoices/:id`, `GET /invoices` |
 | 6. Matching, payment, exceptions | [`exceptions-api.md`](./exceptions-api.md) | `GET /exceptions`, `GET /exceptions/:id`, `POST /exceptions/:id/resolve` |
 | Cross-cutting: activity log | [`audit-logs-api.md`](./audit-logs-api.md) | `GET /audit-logs` |
