@@ -76,17 +76,14 @@ export function calculatePurchaseOrderTotals(
       });
     }
     const lineTotalPaise = line.quantity * line.unitPricePaise;
-    assertWithinRange(lineTotalPaise, "line total", { productId: line.productId });
+    assertWithinRange(lineTotalPaise, "Purchase order line total", { productId: line.productId });
     return { ...line, lineTotalPaise };
   });
 
   const subtotalPaise = items.reduce((sum, item) => sum + item.lineTotalPaise, 0);
-  assertWithinRange(subtotalPaise, "subtotal");
-  // Basis points, so the divisor is 10,000. Rounded to whole paise exactly once,
-  // on the subtotal, rather than per line — the PO total is what gets matched
-  // against the supplier's invoice later.
-  const taxPaise = Math.round((subtotalPaise * taxRateBps) / 10_000);
-  assertWithinRange(subtotalPaise + taxPaise, "total");
+  assertWithinRange(subtotalPaise, "Purchase order subtotal");
+  const taxPaise = roundTaxPaise(subtotalPaise, taxRateBps);
+  assertWithinRange(subtotalPaise + taxPaise, "Purchase order total");
 
   return {
     items,
@@ -97,14 +94,33 @@ export function calculatePurchaseOrderTotals(
   };
 }
 
-function assertWithinRange(paise: number, label: string, details?: Record<string, unknown>): void {
+/**
+ * Shared by src/rules/generatedInvoice.ts as well — every Prisma `Int` paise
+ * column across POs and system-generated invoices has the same 32-bit bound.
+ */
+export function assertWithinRange(
+  paise: number,
+  label: string,
+  details?: Record<string, unknown>,
+): void {
   if (paise > MAX_MONEY_PAISE) {
-    throw AppError.validation(`Purchase order ${label} exceeds the maximum supported amount`, {
+    throw AppError.validation(`${label} exceeds the maximum supported amount`, {
       ...details,
       paise,
       maxPaise: MAX_MONEY_PAISE,
     });
   }
+}
+
+/**
+ * Basis points, so the divisor is 10,000. Rounded to whole paise exactly
+ * once, on the subtotal, rather than per line. Shared with
+ * src/rules/generatedInvoice.ts so a generated invoice's tax always agrees
+ * with the PO it was generated from — the two are matched against each other
+ * in three-way matching.
+ */
+export function roundTaxPaise(subtotalPaise: number, taxRateBps: number): number {
+  return Math.round((subtotalPaise * taxRateBps) / 10_000);
 }
 
 export interface ApprovalDecision {

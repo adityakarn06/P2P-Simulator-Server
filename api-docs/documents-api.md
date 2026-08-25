@@ -93,7 +93,7 @@ already-known numbers. Download it with `GET /invoices/:id/pdf` (below).
 | Status | Code | When |
 | --- | --- | --- |
 | 404 | `NOT_FOUND` | Unknown purchase order, or one owned by another organization; unknown `purchaseOrderItemId` in `items[]` |
-| 400 | `VALIDATION_ERROR` | A negative or fractional override `quantity` |
+| 400 | `VALIDATION_ERROR` | A negative, fractional or out-of-range override `quantity`; the same `purchaseOrderItemId` repeated in `items[]` |
 | 409 | `INVALID_STATE` | Purchase order is `DRAFT`, `PENDING_APPROVAL` or `REJECTED` |
 | 503 | `DEPENDENCY_UNAVAILABLE` | Cloudinary unreachable while storing the rendered PDF |
 

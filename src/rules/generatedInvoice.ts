@@ -1,29 +1,16 @@
 import { AppError } from "../utils/AppError.js";
-import { MAX_MONEY_PAISE } from "./approvalRules.js";
+import { assertWithinRange, MAX_MONEY_PAISE, roundTaxPaise } from "./approvalRules.js";
 
 /**
  * Deterministic money math for a system-generated (PDFKit) invoice, mirroring
  * calculatePurchaseOrderTotals in src/rules/approvalRules.ts. Pure functions,
  * no I/O — CLAUDE.md: "Never let an LLM calculate totals," and nothing here is
  * an LLM either. Every amount is an integer number of paise.
+ *
+ * Shares assertWithinRange and roundTaxPaise with approvalRules.ts so a
+ * generated invoice's totals can never drift from the PO they're built from
+ * (they're matched against each other in three-way matching).
  */
-
-/**
- * Every paise column on Invoice/InvoiceItem is a Prisma `Int` (32-bit Postgres
- * integer), same as PurchaseOrder/PurchaseOrderItem. Mirrors assertWithinRange
- * in src/rules/approvalRules.ts so a large quantity override fails here with a
- * clean 400 rather than as an opaque Postgres integer-overflow error during
- * tx.invoice.create.
- */
-function assertWithinRange(paise: number, label: string, details?: Record<string, unknown>): void {
-  if (paise > MAX_MONEY_PAISE) {
-    throw AppError.validation(`Generated invoice ${label} exceeds the maximum supported amount`, {
-      ...details,
-      paise,
-      maxPaise: MAX_MONEY_PAISE,
-    });
-  }
-}
 
 export interface PurchaseOrderLineForInvoice {
   purchaseOrderItemId: string;
@@ -72,16 +59,27 @@ export function buildGeneratedInvoiceLines(
   const overrideById = new Map((overrides ?? []).map((o) => [o.purchaseOrderItemId, o]));
   const poLineIds = new Set(poLines.map((line) => line.purchaseOrderItemId));
 
+  if (overrides && overrides.length !== overrideById.size) {
+    throw AppError.validation(
+      "Invoice line overrides must not repeat the same purchase order line item",
+    );
+  }
+
   for (const override of overrides ?? []) {
     if (!poLineIds.has(override.purchaseOrderItemId)) {
       throw AppError.validation("Line item does not belong to this purchase order", {
         purchaseOrderItemId: override.purchaseOrderItemId,
       });
     }
-    if (!Number.isInteger(override.quantity) || override.quantity < 0) {
+    if (
+      !Number.isInteger(override.quantity) ||
+      override.quantity < 0 ||
+      override.quantity > MAX_MONEY_PAISE
+    ) {
       throw AppError.validation("Invoice line quantity must be a non-negative integer", {
         purchaseOrderItemId: override.purchaseOrderItemId,
         quantity: override.quantity,
+        maxQuantity: MAX_MONEY_PAISE,
       });
     }
   }
@@ -89,7 +87,7 @@ export function buildGeneratedInvoiceLines(
   return poLines.map((line) => {
     const quantity = overrideById.get(line.purchaseOrderItemId)?.quantity ?? line.quantity;
     const lineTotalPaise = quantity * line.unitPricePaise;
-    assertWithinRange(lineTotalPaise, "line total", {
+    assertWithinRange(lineTotalPaise, "Generated invoice line total", {
       purchaseOrderItemId: line.purchaseOrderItemId,
     });
 
@@ -110,19 +108,15 @@ export interface GeneratedInvoiceTotals {
   totalPaise: number;
 }
 
-/**
- * Same rounding convention as calculatePurchaseOrderTotals: tax is rounded to
- * whole paise exactly once, on the subtotal, not per line.
- */
 export function computeGeneratedInvoiceTotals(
   lines: GeneratedInvoiceLine[],
   taxRateBps: number,
 ): GeneratedInvoiceTotals {
   const subtotalPaise = lines.reduce((sum, line) => sum + line.lineTotalPaise, 0);
-  assertWithinRange(subtotalPaise, "subtotal");
+  assertWithinRange(subtotalPaise, "Generated invoice subtotal");
 
-  const taxPaise = Math.round((subtotalPaise * taxRateBps) / 10_000);
-  assertWithinRange(subtotalPaise + taxPaise, "total");
+  const taxPaise = roundTaxPaise(subtotalPaise, taxRateBps);
+  assertWithinRange(subtotalPaise + taxPaise, "Generated invoice total");
 
   return { subtotalPaise, taxPaise, totalPaise: subtotalPaise + taxPaise };
 }

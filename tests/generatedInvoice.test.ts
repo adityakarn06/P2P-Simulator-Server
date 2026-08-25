@@ -67,6 +67,18 @@ describe("buildGeneratedInvoiceLines", () => {
     ).toThrow(AppError);
   });
 
+  it("rejects overrides that repeat the same purchaseOrderItemId", () => {
+    expect(() =>
+      buildGeneratedInvoiceLines(
+        [poLine()],
+        [
+          { purchaseOrderItemId: "poi-1", quantity: 5 },
+          { purchaseOrderItemId: "poi-1", quantity: 50 },
+        ],
+      ),
+    ).toThrow(AppError);
+  });
+
   it("rejects a purchase order with no lines", () => {
     expect(() => buildGeneratedInvoiceLines([])).toThrow(AppError);
   });

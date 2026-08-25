@@ -305,6 +305,15 @@ export interface GenerateInvoiceResult {
  * insert fails with a unique-constraint violation, caught below, which
  * deletes its now-orphaned upload and returns the winner's row instead of
  * erroring or leaving two GENERATED invoices on one purchase order.
+ *
+ * The PDF render and Cloudinary upload below run inline in this request,
+ * not behind a queue job. This is a deliberate exception to the "no
+ * long-running work inside Express" rule, not an oversight: the CLAUDE.md
+ * spec for the *real* invoice-upload path (§7) has the equivalent storage
+ * upload happen synchronously in the request too — only Gemini/OCR extraction
+ * is deferred to a worker there. There is no such AI step here (every figure
+ * is already known from the PO), so a queue would add a job/worker/status
+ * round trip without deferring anything actually slow or non-deterministic.
  */
 export async function generateInvoiceForPurchaseOrder(
   params: GenerateInvoiceParams,

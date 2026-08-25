@@ -45,12 +45,18 @@ export interface TableColumn {
 
 const PAGE_BOTTOM_MARGIN = 50;
 
-/** Starts a new page (repeating the header row) when the cursor is too close to the bottom. */
-function ensureRoom(doc: PDFKit.PDFDocument, rowHeight: number): void {
+/**
+ * Starts a new page when the cursor is too close to the bottom. Returns
+ * whether it did, so the caller can react (e.g. redraw a header row) instead
+ * of inferring a page break from an incidental doc.y value.
+ */
+function ensureRoom(doc: PDFKit.PDFDocument, rowHeight: number): boolean {
   const bottom = doc.page.height - doc.page.margins.bottom - PAGE_BOTTOM_MARGIN;
   if (doc.y + rowHeight > bottom) {
     doc.addPage();
+    return true;
   }
+  return false;
 }
 
 export function drawDocumentHeader(
@@ -101,16 +107,42 @@ export function drawLineItemTable(
   const left = doc.page.margins.left;
   const rowHeight = 20;
 
-  function drawHeaderRow(): void {
+  /** Tallest bottom edge reached by any cell in `cells`, laid out at the current doc.y. */
+  function drawRowCells(cells: string[]): number {
     let x = left;
-    doc.font("Helvetica-Bold").fontSize(9);
     const y = doc.y;
-    for (const column of columns) {
-      doc.text(column.label, x, y, { width: column.width, align: column.align ?? "left" });
+    let maxBottom = y;
+    cells.forEach((cell, index) => {
+      const column = columns[index];
+      if (!column) {
+        return;
+      }
+      doc.text(cell, x, y, { width: column.width, align: column.align ?? "left" });
+      maxBottom = Math.max(maxBottom, doc.y);
       x += column.width;
-    }
+    });
+    return maxBottom;
+  }
+
+  /** Estimated height of `cells` if drawn now, accounting for wrapped multi-line text. */
+  function measureRowHeight(cells: string[]): number {
+    let maxHeight = rowHeight;
+    cells.forEach((cell, index) => {
+      const column = columns[index];
+      if (!column) {
+        return;
+      }
+      maxHeight = Math.max(maxHeight, doc.heightOfString(cell, { width: column.width }));
+    });
+    return maxHeight;
+  }
+
+  function drawHeaderRow(): void {
+    doc.font("Helvetica-Bold").fontSize(9);
+    const right = left + columns.reduce((sum, column) => sum + column.width, 0);
+    doc.y = drawRowCells(columns.map((column) => column.label));
     doc.moveDown(0.9);
-    doc.moveTo(left, doc.y).lineTo(x, doc.y).strokeColor("#000000").stroke();
+    doc.moveTo(left, doc.y).lineTo(right, doc.y).strokeColor("#000000").stroke();
     doc.moveDown(0.3);
   }
 
@@ -119,21 +151,12 @@ export function drawLineItemTable(
 
   doc.font("Helvetica").fontSize(9);
   for (const row of rows) {
-    ensureRoom(doc, rowHeight);
-    if (doc.y === doc.page.margins.top) {
+    const startedNewPage = ensureRoom(doc, measureRowHeight(row));
+    if (startedNewPage) {
       drawHeaderRow();
     }
 
-    let x = left;
-    const y = doc.y;
-    row.forEach((cell, index) => {
-      const column = columns[index];
-      if (!column) {
-        return;
-      }
-      doc.text(cell, x, y, { width: column.width, align: column.align ?? "left" });
-      x += column.width;
-    });
+    doc.y = drawRowCells(row);
     doc.moveDown(0.9);
   }
 
