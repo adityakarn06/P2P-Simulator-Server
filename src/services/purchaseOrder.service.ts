@@ -285,7 +285,7 @@ export async function applyPurchaseOrderCreation(
     // on the expected status means the loser writes nothing at all instead of
     // creating a second purchase order for the same requisition.
     const claimed = await tx.requisition.updateMany({
-      where: { id: requisitionId, status: RequisitionStatus.SUPPLIER_SELECTED },
+      where: { id: requisitionId, organizationId, status: RequisitionStatus.SUPPLIER_SELECTED },
       data: { status: RequisitionStatus.PO_CREATED, failureReason: null },
     });
 
@@ -650,7 +650,7 @@ export async function approvePurchaseOrder(params: {
   return prisma.$transaction(async (tx) => {
     // Guarded so two concurrent approvals cannot both transition it.
     const claimed = await tx.purchaseOrder.updateMany({
-      where: { id: purchaseOrderId, status: PurchaseOrderStatus.PENDING_APPROVAL },
+      where: { id: purchaseOrderId, organizationId, status: PurchaseOrderStatus.PENDING_APPROVAL },
       data: {
         status: PurchaseOrderStatus.APPROVED,
         approvedAt: new Date(),
@@ -740,7 +740,7 @@ export async function rejectPurchaseOrder(params: {
 
   return prisma.$transaction(async (tx) => {
     const claimed = await tx.purchaseOrder.updateMany({
-      where: { id: purchaseOrderId, status: PurchaseOrderStatus.PENDING_APPROVAL },
+      where: { id: purchaseOrderId, organizationId, status: PurchaseOrderStatus.PENDING_APPROVAL },
       data: {
         status: PurchaseOrderStatus.REJECTED,
         rejectedAt: new Date(),

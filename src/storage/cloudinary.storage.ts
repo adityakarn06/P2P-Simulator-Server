@@ -39,6 +39,14 @@ const SIGNATURE_CHECKS: Record<AllowedMimeType, (buffer: Buffer) => boolean> = {
  */
 const DOWNLOAD_LINK_TTL_SECONDS = 300;
 
+/**
+ * Hard ceiling on a single document download. Without it a hung Cloudinary
+ * connection never settles, and the invoice worker's job sits open forever
+ * holding a concurrency slot — BullMQ's retries only help once an attempt
+ * actually fails. Mirrors the timeout the Gemini provider applies.
+ */
+const DOWNLOAD_TIMEOUT_MS = 30_000;
+
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
@@ -189,7 +197,8 @@ export class CloudinaryStorage implements StorageProvider {
     });
 
     try {
-      response = await fetch(url);
+      // The signal aborts the body stream too, not just the initial response.
+      response = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
     } catch (error) {
       throw AppError.dependencyUnavailable("Failed to download document from Cloudinary", {
         cause: error instanceof Error ? error.message : error,
@@ -216,7 +225,15 @@ export class CloudinaryStorage implements StorageProvider {
       });
     }
 
-    return Buffer.from(await response.arrayBuffer());
+    try {
+      return Buffer.from(await response.arrayBuffer());
+    } catch (error) {
+      // A body that stalls mid-stream aborts here rather than hanging the job.
+      throw AppError.dependencyUnavailable("Failed to read document from Cloudinary", {
+        storageKey,
+        cause: error instanceof Error ? error.message : error,
+      });
+    }
   }
 
   /**

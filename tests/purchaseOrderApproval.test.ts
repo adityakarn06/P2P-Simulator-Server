@@ -130,7 +130,9 @@ describe("POST /api/v1/purchase-orders/:id/approve", () => {
     expect(res.body.data.purchaseOrder.status).toBe("APPROVED");
     expect(res.body.data.shipment.status).toBe("IN_TRANSIT");
     expect(db.purchaseOrder.updateMany).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { id: PO, status: "PENDING_APPROVAL" } }),
+      expect.objectContaining({
+        where: { id: PO, organizationId: ORG, status: "PENDING_APPROVAL" },
+      }),
     );
     expect(auditActions()).toEqual(["PO_APPROVED", "SHIPMENT_CREATED", "EXCEPTION_RESOLVED"]);
   });

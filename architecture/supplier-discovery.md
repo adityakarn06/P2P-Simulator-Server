@@ -185,7 +185,7 @@ Assume every job runs more than once.
   requisition in `SUPPLIER_SELECTED` forever. Phase 4's guard does the same one stage earlier.
 - **Concurrent runs.** Two jobs can both pass the status check before either commits, so the
   transition is *claimed* with a guarded write:
-  `updateMany({ where: { id, status: REQUIREMENTS_EXTRACTED } })`. A zero-row result raises
+  `updateMany({ where: { id, organizationId, status: REQUIREMENTS_EXTRACTED } })`. A zero-row result raises
   `CONFLICT`, rolling the loser's transaction back before it writes anything. The loser then returns
   `skipped` — losing a race is not a system failure.
 - **Partial runs.** Candidates are replaced wholesale (`deleteMany` then `createMany`) and the

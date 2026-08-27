@@ -163,7 +163,7 @@ describe("processSupplierDiscoveryJob — happy path", () => {
 
     // The transition is claimed with a status guard so a concurrent run loses.
     expect(db.requisition.updateMany).toHaveBeenCalledWith({
-      where: { id: REQ, status: "REQUIREMENTS_EXTRACTED" },
+      where: { id: REQ, organizationId: ORG, status: "REQUIREMENTS_EXTRACTED" },
       data: { status: "SUPPLIER_SELECTED", failureReason: null },
     });
     expect(enqueuePurchaseOrder).toHaveBeenCalledExactlyOnceWith({

@@ -50,18 +50,20 @@ function stubSuccessfulUpload(bytes = 1024) {
   mockUrl.mockReturnValue(
     "https://res.cloudinary.com/test/image/authenticated/p2p/invoices/inv-001/receipt.pdf",
   );
-  mockUploadStream.mockImplementation((_opts: unknown, cb: Function) => {
-    const fakeResult = {
-      public_id: "p2p/invoices/inv-001/receipt",
-      secure_url:
-        "https://res.cloudinary.com/test/image/authenticated/p2p/invoices/inv-001/receipt.pdf",
-      bytes,
-    };
-    // Return a stream-like object with an `end` method.
-    return {
-      end: () => cb(null, fakeResult),
-    };
-  });
+  mockUploadStream.mockImplementation(
+    (_opts: unknown, cb: (error: unknown, result?: unknown) => void) => {
+      const fakeResult = {
+        public_id: "p2p/invoices/inv-001/receipt",
+        secure_url:
+          "https://res.cloudinary.com/test/image/authenticated/p2p/invoices/inv-001/receipt.pdf",
+        bytes,
+      };
+      // Return a stream-like object with an `end` method.
+      return {
+        end: () => cb(null, fakeResult),
+      };
+    },
+  );
 }
 
 /** Minimal valid magic-byte prefixes for each allowed MIME type. */
@@ -189,9 +191,11 @@ describe("CloudinaryStorage", () => {
 
   describe("upload – Cloudinary failure", () => {
     it("wraps SDK errors as DEPENDENCY_UNAVAILABLE", async () => {
-      mockUploadStream.mockImplementation((_opts: unknown, cb: Function) => ({
-        end: () => cb(new Error("Network timeout")),
-      }));
+      mockUploadStream.mockImplementation(
+        (_opts: unknown, cb: (error: unknown, result?: unknown) => void) => ({
+          end: () => cb(new Error("Network timeout")),
+        }),
+      );
 
       const input = validInput();
 
@@ -247,7 +251,11 @@ describe("CloudinaryStorage", () => {
         const result = await storage.download("p2p/invoices/inv-001/receipt", "application/pdf");
 
         expect(result.equals(body)).toBe(true);
-        expect(fetchMock).toHaveBeenCalledWith("https://api.cloudinary.com/private-download");
+        // The abort signal is the only thing stopping a hung Cloudinary socket
+        // from pinning an invoice worker's job open forever.
+        expect(fetchMock).toHaveBeenCalledWith("https://api.cloudinary.com/private-download", {
+          signal: expect.any(AbortSignal),
+        });
 
         // Not the delivery URL: Cloudinary accounts block PDF *delivery* by
         // default and answer 401 no matter how well the URL is signed, so the

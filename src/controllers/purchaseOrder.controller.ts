@@ -95,7 +95,7 @@ export async function getPurchaseOrderPdf(req: Request, res: Response): Promise<
 export async function postGenerateInvoice(req: Request, res: Response): Promise<void> {
   const { organizationId, userId } = requireTenant(req);
   const { id } = purchaseOrderIdParamSchema.parse(req.params);
-  const { items } = generateInvoiceSchema.parse(req.body);
+  const { items } = generateInvoiceSchema.parse(req.body ?? {});
 
   const { invoice, created } = await generateInvoiceForPurchaseOrder({
     organizationId,

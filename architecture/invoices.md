@@ -117,6 +117,12 @@ attempt: `VALIDATION_ERROR` (an empty or corrupt document) and `NOT_FOUND` — t
 (`src/workers/invoice.worker.ts`, `PERMANENT_ERROR_CODES`). Both skip straight to the terminal-failure
 path below instead of burning two more Gemini calls.
 
+Both external calls are time-boxed, because BullMQ's retries only help once an attempt actually
+*fails*: Gemini at 30s inside `GeminiProvider`, and the Cloudinary download at 30s via an
+`AbortSignal.timeout` covering the body stream as well as the initial response. Without those a hung
+socket would never settle, holding a worker concurrency slot open indefinitely instead of failing and
+being retried. A timeout surfaces as `DEPENDENCY_UNAVAILABLE` and takes the ordinary retry path.
+
 Once the attempts are spent, `applyInvoiceExtractionFailure()` sets the invoice `FAILED`, records
 `failureReason`, opens an `INVOICE_EXTRACTION_FAILED` exception at `CRITICAL`, and writes a
 `WORKFLOW_FAILED` audit row. The document stays in Cloudinary so a human can look at what the model
@@ -136,8 +142,14 @@ MB, and its only real job is translating `MulterError` into the standard `VALIDA
 so an oversized upload isn't reported as a 500.
 
 Cloudinary objects are uploaded as `type: "authenticated"`, so the stored `fileUrl` is a signed,
-expiring URL and the asset is not publicly readable. `download()` in the worker fetches through that
-same signed URL — an unsigned delivery URL 401s.
+expiring URL and the asset is not publicly readable.
+
+`download()` in the worker deliberately does **not** use that delivery URL. Cloudinary accounts block
+PDF delivery by default, and that restriction answers 401 however well-signed the delivery URL is —
+so a PDF invoice, which is most of them, could never be read back. It uses
+`cloudinary.utils.private_download_url()` instead: the Admin API download link, signed with the API
+secret, which bypasses the delivery-format restriction and returns the exact bytes that were
+uploaded rather than a re-encoded derivative. The link is minted per call with a 5-minute TTL.
 
 ## Failure modes
 
@@ -149,6 +161,7 @@ same signed URL — an unsigned delivery URL 401s.
 | Unsupported type, over 10 MB, empty, or signature mismatch | 400 `VALIDATION_ERROR`, nothing written |
 | Transaction fails after a successful upload | The Cloudinary object is deleted, the error propagates, no job is queued |
 | Cloudinary or Gemini unavailable | Retried up to 3 times, then `FAILED` + `INVOICE_EXTRACTION_FAILED` |
+| Cloudinary or Gemini hangs without responding | Aborted at 30s, then treated as unavailable above — a stalled socket never pins a worker slot |
 | Model returns malformed JSON or a schema violation | Same — retried, then terminal |
 | Model returns a total that disagrees with its line items | Stored as transcribed; three-way matching flags it |
 

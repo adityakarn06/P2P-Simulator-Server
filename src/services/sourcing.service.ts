@@ -137,7 +137,11 @@ export async function applySourcingSuccess(params: {
     // the expected status means the loser writes nothing at all, instead of
     // overwriting the winner's candidates, decision and purchase-order job.
     const claimed = await tx.requisition.updateMany({
-      where: { id: requisitionId, status: RequisitionStatus.REQUIREMENTS_EXTRACTED },
+      where: {
+        id: requisitionId,
+        organizationId,
+        status: RequisitionStatus.REQUIREMENTS_EXTRACTED,
+      },
       data: { status: RequisitionStatus.SUPPLIER_SELECTED, failureReason: null },
     });
 

@@ -160,7 +160,7 @@ describe("processPurchaseOrderJob — happy path", () => {
     await processPurchaseOrderJob(job());
 
     expect(db.requisition.updateMany).toHaveBeenCalledWith({
-      where: { id: REQ, status: "SUPPLIER_SELECTED" },
+      where: { id: REQ, organizationId: ORG, status: "SUPPLIER_SELECTED" },
       data: { status: "PO_CREATED", failureReason: null },
     });
   });
