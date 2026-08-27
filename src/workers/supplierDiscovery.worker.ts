@@ -21,6 +21,7 @@ import {
 } from "../services/sourcing.service.js";
 import { supplierDiscoveryJobSchema } from "../types/types.js";
 import { AppError } from "../utils/AppError.js";
+import { parseJobData } from "./parseJobData.js";
 
 export interface SupplierDiscoveryResult {
   requisitionId: string;
@@ -72,7 +73,11 @@ function summarizeRejections(candidates: RankedCandidate[]): string {
  * that cannot change.
  */
 export async function processSupplierDiscoveryJob(job: Job): Promise<SupplierDiscoveryResult> {
-  const { requisitionId, organizationId } = supplierDiscoveryJobSchema.parse(job.data);
+  const { requisitionId, organizationId } = parseJobData(
+    supplierDiscoveryJobSchema,
+    job.data,
+    "supplier-discovery",
+  );
 
   // Loaded outside the guard below: if the requisition cannot be read there is
   // nothing to record a failure against, so that error must surface as-is.

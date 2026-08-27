@@ -269,6 +269,50 @@ describe("processPaymentJob — refusals", () => {
     expect(charge).not.toHaveBeenCalled();
   });
 
+  // A PROCESSING row may belong to a worker that is inside charge() right now,
+  // so it is only taken over once its lease has expired — or when it is this
+  // attempt's own claim, identified by the (retry-stable) BullMQ job id.
+  it("only resumes a PROCESSING claim that is its own or has gone stale", async () => {
+    db.invoice.findFirst.mockResolvedValue(buildContext());
+    db.payment.create.mockRejectedValue(uniqueViolation());
+    // The fresh-approval claim matches nothing, so the resume claim runs.
+    db.payment.updateMany.mockResolvedValueOnce({ count: 0 }).mockResolvedValue({ count: 1 });
+
+    await processPaymentJob({
+      data: { invoiceId: INVOICE, organizationId: ORG },
+      attemptsMade: 0,
+      opts: { attempts: 3 },
+      id: "job-42",
+    } as unknown as Job);
+
+    const resume = db.payment.updateMany.mock.calls[1]?.[0] as {
+      where: { status: string; OR: Array<Record<string, unknown>> };
+    };
+    expect(resume.where.status).toBe("PROCESSING");
+    // Its own claim, by job id.
+    expect(resume.where.OR).toContainEqual({ claimedBy: "job-42" });
+    // Or an abandoned one, by lease age.
+    expect(
+      resume.where.OR.some(
+        (clause) => "processedAt" in clause && "lt" in (clause.processedAt as object),
+      ),
+    ).toBe(true);
+  });
+
+  it("stamps the claim owner so a retry can resume its own attempt", async () => {
+    db.invoice.findFirst.mockResolvedValue(buildContext());
+
+    await processPaymentJob({
+      data: { invoiceId: INVOICE, organizationId: ORG },
+      attemptsMade: 0,
+      opts: { attempts: 3 },
+      id: "job-7",
+    } as unknown as Job);
+
+    const created = firstArg(db.payment.create) as { data: { claimedBy: string } };
+    expect(created.data.claimedBy).toBe("job-7");
+  });
+
   it("does not mark the invoice PAID when the settle update finds nothing to move", async () => {
     db.invoice.findFirst.mockResolvedValue(buildContext());
     db.payment.updateMany.mockResolvedValue({ count: 0 });

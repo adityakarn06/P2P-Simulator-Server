@@ -69,8 +69,12 @@ export function calculatePurchaseOrderTotals(
         quantity: line.quantity,
       });
     }
-    if (!Number.isInteger(line.unitPricePaise) || line.unitPricePaise < 0) {
-      throw AppError.validation("Purchase order unit price must be a non-negative integer", {
+    // Zero is rejected, not just negatives. A ₹0 line is a bug upstream, and it
+    // would also poison three-way matching: compareRelative treats an expected 0
+    // as "equality wins", so a ₹0 purchase-order line would let an invoice line
+    // that printed no price at all (persisted as 0 below) pass UNIT_PRICE.
+    if (!Number.isInteger(line.unitPricePaise) || line.unitPricePaise <= 0) {
+      throw AppError.validation("Purchase order unit price must be a positive integer", {
         productId: line.productId,
         unitPricePaise: line.unitPricePaise,
       });

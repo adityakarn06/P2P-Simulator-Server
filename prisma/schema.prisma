@@ -537,16 +537,16 @@ model Invoice {
   invoiceNumber           String?
   normalizedInvoiceNumber String?
   invoiceDate             DateTime?
-  supplierNameRaw    String?
-  poNumberRaw        String?
-  subtotalPaise      Int?
-  taxPaise           Int?
-  totalPaise         Int?
-  currency           String?
-  extractedAt        DateTime?
-  rawExtraction      Json?
-  extractionAttempts Int       @default(0)
-  failureReason      String?
+  supplierNameRaw         String?
+  poNumberRaw             String?
+  subtotalPaise           Int?
+  taxPaise                Int?
+  totalPaise              Int?
+  currency                String?
+  extractedAt             DateTime?
+  rawExtraction           Json?
+  extractionAttempts      Int       @default(0)
+  failureReason           String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -568,14 +568,23 @@ model Invoice {
 }
 
 model InvoiceItem {
-  id             String  @id @default(cuid())
-  invoiceId      String
-  lineNumber     Int
-  description    String
-  quantity       Int
-  unitPricePaise Int
-  lineTotalPaise Int
-  productId      String?
+  id          String @id @default(cuid())
+  invoiceId   String
+  lineNumber  Int
+  description String
+  quantity    Int
+
+  /**
+   * Nullable because the document may simply not print the figure. "Not
+   * printed" is not ₹0: storing a zero would make an unpriced line compare
+   * equal against a ₹0 purchase-order line and pass UNIT_PRICE. Three-way
+   * matching treats null as `missing`, which never passes. Always populated on
+   * a GENERATED invoice, whose lines are computed deterministically.
+   */
+  unitPricePaise Int?
+  lineTotalPaise Int?
+
+  productId String?
 
   createdAt DateTime @default(now())
 
@@ -637,8 +646,19 @@ model Payment {
   providerReference String?
   blockedReason     String?
   failureReason     String?
-  processedAt       DateTime?
-  completedAt       DateTime?
+
+  /**
+   * Identifies the attempt that currently holds the PROCESSING claim (the
+   * BullMQ job id, which is stable across that job's retries). A worker may
+   * always re-claim its own row; another worker may only take it over once the
+   * claim has gone stale. Without this, either two workers can charge the same
+   * invoice or a worker's own retry cannot resume its interrupted attempt.
+   * See claimPaymentForProcessing in src/services/payment.service.ts.
+   */
+  claimedBy String?
+
+  processedAt DateTime?
+  completedAt DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

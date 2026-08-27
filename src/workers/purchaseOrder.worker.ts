@@ -17,6 +17,7 @@ import {
 } from "../services/purchaseOrder.service.js";
 import { purchaseOrderJobSchema } from "../types/types.js";
 import { AppError } from "../utils/AppError.js";
+import { parseJobData } from "./parseJobData.js";
 
 export interface PurchaseOrderResult {
   requisitionId: string;
@@ -38,7 +39,11 @@ export interface PurchaseOrderResult {
  * human action (POST /api/v1/purchase-orders/:id/approve).
  */
 export async function processPurchaseOrderJob(job: Job): Promise<PurchaseOrderResult> {
-  const { requisitionId, organizationId } = purchaseOrderJobSchema.parse(job.data);
+  const { requisitionId, organizationId } = parseJobData(
+    purchaseOrderJobSchema,
+    job.data,
+    "purchase-order",
+  );
 
   // Loaded outside the guard below: if the requisition cannot be read there is
   // nothing to record a failure against, so that error must surface as-is.

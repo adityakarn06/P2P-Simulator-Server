@@ -70,8 +70,9 @@ export interface MatchInvoiceLine {
   lineNumber: number;
   description: string;
   quantity: number;
-  unitPricePaise: number;
-  lineTotalPaise: number;
+  /** Null when the document did not print the figure — never treated as 0. */
+  unitPricePaise: number | null;
+  lineTotalPaise: number | null;
 }
 
 /**
@@ -314,12 +315,16 @@ function compareRelative(expected: number, actual: number, tolerance: number): L
     return { label: "", expected, actual, variance: null, withinTolerance: actual === 0 };
   }
 
-  const ratio = round4((actual - expected) / expected);
+  // The tolerance test uses the exact ratio; only the *reported* variance is
+  // rounded. Rounding first would silently widen every money tolerance by up to
+  // half of round4's precision — a 2.0049% overcharge would report as 2.00% and
+  // pass a 2% tolerance.
+  const ratio = (actual - expected) / expected;
   return {
     label: "",
     expected,
     actual,
-    variance: ratio,
+    variance: round4(ratio),
     withinTolerance: Math.abs(ratio) <= tolerance,
   };
 }
@@ -616,6 +621,19 @@ function checkUnitPrice(
 
   for (const entry of resolution.byProduct.values()) {
     for (const invoiceLine of entry.invoiceLines) {
+      if (invoiceLine.unitPricePaise === null) {
+        // The line printed no price. That is not agreement at any tolerance, so
+        // it fails outright rather than being compared against a stand-in zero.
+        comparisons.push({
+          label: entry.line.productName,
+          expected: entry.line.unitPricePaise,
+          actual: 0,
+          variance: null,
+          withinTolerance: false,
+        });
+        continue;
+      }
+
       comparisons.push({
         ...compareRelative(
           entry.line.unitPricePaise,

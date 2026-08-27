@@ -93,6 +93,18 @@ describe("calculatePurchaseOrderTotals", () => {
     );
   });
 
+  // A ₹0 line is a bug upstream, and it would also poison three-way matching:
+  // compareRelative treats an expected 0 as "equality wins", so a ₹0 PO line
+  // would let an invoice line that printed no price at all pass UNIT_PRICE.
+  it("refuses a non-positive unit price", () => {
+    expect(() =>
+      calculatePurchaseOrderTotals([line({ unitPricePaise: 0 })], DEFAULT_TAX_RATE_BPS),
+    ).toThrow(AppError);
+    expect(() =>
+      calculatePurchaseOrderTotals([line({ unitPricePaise: -1 })], DEFAULT_TAX_RATE_BPS),
+    ).toThrow(AppError);
+  });
+
   it("refuses a non-positive quantity", () => {
     expect(() =>
       calculatePurchaseOrderTotals([line({ quantity: 0 })], DEFAULT_TAX_RATE_BPS),

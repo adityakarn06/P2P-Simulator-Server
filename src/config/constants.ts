@@ -49,6 +49,18 @@ export const APPROVAL_THRESHOLDS_PAISE = {
   TRUSTED_SUPPLIER_AUTO_APPROVE_BELOW: 1_000_000_00,
 } as const;
 
+/**
+ * How long a payment attempt may hold its PROCESSING claim before another
+ * attempt is allowed to take it over.
+ *
+ * A PROCESSING row means "somebody is inside the provider call". Re-claiming it
+ * unconditionally lets a concurrent job charge the same invoice twice; never
+ * re-claiming it strands the payment forever when a worker is killed mid-charge.
+ * The lease resolves both: only a claim older than this is considered abandoned.
+ * Comfortably longer than any provider call the worker will make.
+ */
+export const PAYMENT_CLAIM_LEASE_MS = 120_000;
+
 // Three-way match tolerances.
 export const MATCH_TOLERANCES = {
   QUANTITY: 0,

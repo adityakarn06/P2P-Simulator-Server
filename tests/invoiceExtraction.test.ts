@@ -28,6 +28,40 @@ describe("invoiceExtractionSchema", () => {
     expect(invoiceExtractionSchema.safeParse(extraction()).success).toBe(true);
   });
 
+  // Every paise column this lands in is a Prisma `Int` (32-bit). Without the
+  // bound, a hallucinated amount reaches the insert and surfaces as an opaque
+  // int4 overflow inside the extraction transaction, which the worker can only
+  // read as a technical failure and retry three times.
+  it("rejects an amount that would overflow the paise column", () => {
+    expect(invoiceExtractionSchema.safeParse(extraction({ total: "99999999999" })).success).toBe(
+      false,
+    );
+    expect(
+      invoiceExtractionSchema.safeParse(
+        extraction({
+          items: [
+            {
+              description: "Wireless Keyboard",
+              quantity: 1,
+              unitPrice: "99999999999",
+              lineTotal: "99999999999",
+            },
+          ],
+        }),
+      ).success,
+    ).toBe(false);
+  });
+
+  it("accepts the largest amount that still fits", () => {
+    // MAX_MONEY_PAISE is 2_147_483_647 paise — ₹21,474,836.47.
+    expect(invoiceExtractionSchema.safeParse(extraction({ total: "21474836.47" })).success).toBe(
+      true,
+    );
+    expect(invoiceExtractionSchema.safeParse(extraction({ total: "21474836.48" })).success).toBe(
+      false,
+    );
+  });
+
   it("accepts an entirely unreadable document as nulls with no items", () => {
     const parsed = invoiceExtractionSchema.safeParse({
       invoiceNumber: null,

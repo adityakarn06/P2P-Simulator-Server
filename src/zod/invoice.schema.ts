@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { InvoiceSource, InvoiceStatus } from "../generated/prisma/enums.js";
+import { MAX_MONEY_PAISE } from "../rules/approvalRules.js";
 
 // ---------------------------------------------------------------------------
 // API input
@@ -42,6 +43,14 @@ const MAX_INVOICE_ITEMS = 100;
 const money = z
   .string()
   .regex(/^\d+(\.\d{1,2})?$/, "Expected a plain decimal amount such as 1820.50")
+  // Every paise column this lands in is a Prisma `Int` (32-bit Postgres
+  // integer). Without this bound a hallucinated "99999999999" reaches the
+  // insert and surfaces as an opaque int4 overflow *inside* the extraction
+  // transaction, which the worker can only read as a technical failure and
+  // retry three times. Rejected here it is ordinary malformed AI output.
+  .refine((value) => (toPaise(value) ?? 0) <= MAX_MONEY_PAISE, {
+    message: `Amount exceeds the maximum supported value (${MAX_MONEY_PAISE} paise)`,
+  })
   .nullable();
 
 export const invoiceItemExtractionSchema = z.object({

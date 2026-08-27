@@ -16,6 +16,7 @@ import { getStorageProvider } from "../storage/index.js";
 import { invoiceJobSchema } from "../types/types.js";
 import { AppError, type ErrorCode } from "../utils/AppError.js";
 import { type InvoiceExtraction, invoiceExtractionSchema } from "../zod/invoice.schema.js";
+import { parseJobData } from "./parseJobData.js";
 
 const JOB_TYPE = INVOICE_JOBS.PROCESS_INVOICE;
 const ENTITY_TYPE = "Invoice";
@@ -36,7 +37,7 @@ export interface InvoiceProcessingResult {
  * matching — not this worker — decides whether the invoice is payable.
  */
 export async function processInvoiceJob(job: Job): Promise<InvoiceProcessingResult> {
-  const { invoiceId, organizationId } = invoiceJobSchema.parse(job.data);
+  const { invoiceId, organizationId } = parseJobData(invoiceJobSchema, job.data, "invoice");
 
   const invoice = await loadInvoiceForProcessing({ organizationId, invoiceId });
 
@@ -166,6 +167,10 @@ function safeParseExtraction(raw: string): ParseOutcome {
 const PERMANENT_ERROR_CODES: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
   "VALIDATION_ERROR",
   "NOT_FOUND",
+  // A rejected Gemini request — bad API key, unknown model, malformed request.
+  // Distinct from a Gemini *outage*, which stays DEPENDENCY_UNAVAILABLE and
+  // keeps its retries. See src/ai/GeminiProvider.ts.
+  "AI_PROCESSING_FAILED",
 ]);
 
 /**

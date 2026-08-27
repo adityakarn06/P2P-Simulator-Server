@@ -259,6 +259,56 @@ describe("threeWayMatch — price mismatch", () => {
     expect(result.status).toBe("MATCHED");
   });
 
+  // A price the document never printed is not a price of zero. Storing 0 would
+  // make an unpriced line compare equal against a ₹0 purchase-order line and
+  // pass; null fails outright, the way every other missing figure does.
+  it("fails when the invoice line printed no unit price", () => {
+    const result = run({
+      invoice: invoice({
+        items: [
+          {
+            lineNumber: 1,
+            description: "Wireless Keyboard",
+            quantity: 100,
+            unitPricePaise: null,
+            lineTotalPaise: null,
+          },
+        ],
+      }),
+    });
+
+    expect(checkOf(result, MatchCheckType.UNIT_PRICE).passed).toBe(false);
+    expect(result.status).toBe("MISMATCHED");
+    expect(failedTypes(result)).toContain(MatchCheckType.UNIT_PRICE);
+  });
+
+  // Regression: the tolerance test must use the exact ratio, not the rounded
+  // reporting variance. ₹1,856.49 against ₹1,820.00 is 2.00494...%, which is
+  // outside the 2% tolerance — but round4 renders it as 0.0200, and comparing
+  // *that* against the tolerance would let it through.
+  it("does not let a rounded variance sneak past the tolerance", () => {
+    const result = run({
+      invoice: invoice({
+        items: [
+          {
+            lineNumber: 1,
+            description: "Wireless Keyboard",
+            quantity: 100,
+            unitPricePaise: 185_649,
+            lineTotalPaise: 18_564_900,
+          },
+        ],
+      }),
+    });
+
+    const check = checkOf(result, MatchCheckType.UNIT_PRICE);
+    expect(check.passed).toBe(false);
+    // Reported variance stays rounded for readability, even though the
+    // comparison behind it did not round.
+    expect(check.variance).toBe(0.02);
+    expect(result.status).toBe("MISMATCHED");
+  });
+
   it("is symmetric — undercharging fails too", () => {
     const result = run({
       invoice: invoice({

@@ -1,3 +1,4 @@
+import { PAYMENT_CLAIM_LEASE_MS } from "../config/constants.js";
 import { prisma } from "../config/prisma.js";
 import type { Prisma } from "../generated/prisma/client.js";
 import {
@@ -58,8 +59,16 @@ export async function loadPaymentContext(params: {
  * Two steps, because there are two ways a row can already exist. The create is
  * the race winner on a first run: Payment.invoiceId @unique means exactly one
  * concurrent job can succeed and the loser falls through to the guarded update,
- * which only claims a row that is not already COMPLETED. Between them, two
- * workers can never both reach the provider for one invoice.
+ * which only claims a row that is not already COMPLETED. Between them, exactly
+ * one Payment row and one COMPLETED settlement are guaranteed.
+ *
+ * What is NOT guaranteed is that only one worker reaches the provider. The
+ * resume branch below re-claims a PROCESSING row so an interrupted attempt can
+ * finish, and it cannot tell "my own crashed attempt" from "another worker is
+ * inside charge() right now" — so two concurrent jobs for one invoice can both
+ * call the provider. Harmless against SimulatedPaymentProvider, which is pure;
+ * a real gateway would need this to become a lease (claim only when processedAt
+ * is older than a timeout) plus a provider that honours idempotencyKey.
  *
  * The amount is the purchase order's total — the buyer's own deterministically
  * calculated commitment. The invoice total is transcribed by Gemini and never
@@ -70,25 +79,34 @@ export async function claimPaymentForProcessing(params: {
   organizationId: string;
   invoiceId: string;
   purchaseOrder: { id: string; totalPaise: number; currency: string };
+  /** Identifies this attempt. Stable across the job's own retries. */
+  claimToken: string;
 }): Promise<{ claimed: boolean; amountPaise: number; currency: string }> {
-  const { organizationId, invoiceId, purchaseOrder } = params;
+  const { organizationId, invoiceId, purchaseOrder, claimToken } = params;
   const amount = { amountPaise: purchaseOrder.totalPaise, currency: purchaseOrder.currency };
   const processedAt = new Date();
 
   try {
-    await prisma.payment.create({
-      data: {
-        organizationId,
-        invoiceId,
-        purchaseOrderId: purchaseOrder.id,
-        ...amount,
-        status: PaymentStatus.PROCESSING,
-        provider: PAYMENT_PROVIDER_NAME,
-        processedAt,
-      },
-    });
+    // Create and audit atomically. If the audit failed on its own the row would
+    // already be PROCESSING, and the resume branch below deliberately does not
+    // re-audit — so a half-committed first run would settle with no
+    // PAYMENT_APPROVED row at all. Rolling both back lets the retry redo them.
+    await prisma.$transaction(async (tx) => {
+      await tx.payment.create({
+        data: {
+          organizationId,
+          invoiceId,
+          purchaseOrderId: purchaseOrder.id,
+          ...amount,
+          status: PaymentStatus.PROCESSING,
+          provider: PAYMENT_PROVIDER_NAME,
+          claimedBy: claimToken,
+          processedAt,
+        },
+      });
 
-    await recordPaymentApproved({ organizationId, invoiceId, ...amount });
+      await recordAudit(tx, paymentApprovedAudit({ organizationId, invoiceId, ...amount }));
+    });
 
     return { claimed: true, ...amount };
   } catch (error) {
@@ -98,55 +116,80 @@ export async function claimPaymentForProcessing(params: {
   }
 
   // A row already existed. Claim it only from a state that has not settled —
-  // PROCESSING is this job's own interrupted attempt, BLOCKED has been cleared
-  // by a human (the payment gate already verified that), FAILED is retryable.
-  const { count } = await prisma.payment.updateMany({
-    where: {
-      invoiceId,
-      organizationId,
-      status: {
-        in: [
-          PaymentStatus.PENDING,
-          PaymentStatus.PROCESSING,
-          PaymentStatus.BLOCKED,
-          PaymentStatus.FAILED,
+  // BLOCKED has been cleared by a human (the payment gate already verified
+  // that), FAILED is retryable, PENDING was never started.
+  //
+  // PROCESSING is handled separately below rather than in this set, for two
+  // reasons: re-claiming it is a *resume* rather than a fresh approval, so it
+  // must not append a second PAYMENT_APPROVED audit row; and it may belong to a
+  // worker that is inside the provider call right now, so it is only taken over
+  // once its lease has expired.
+  const claimData = {
+    status: PaymentStatus.PROCESSING,
+    ...amount,
+    provider: PAYMENT_PROVIDER_NAME,
+    purchaseOrderId: purchaseOrder.id,
+    claimedBy: claimToken,
+    processedAt,
+    blockedReason: null,
+    failureReason: null,
+  };
+
+  return prisma.$transaction(async (tx) => {
+    const approved = await tx.payment.updateMany({
+      where: {
+        invoiceId,
+        organizationId,
+        status: {
+          in: [PaymentStatus.PENDING, PaymentStatus.BLOCKED, PaymentStatus.FAILED],
+        },
+      },
+      data: claimData,
+    });
+
+    if (approved.count > 0) {
+      await recordAudit(tx, paymentApprovedAudit({ organizationId, invoiceId, ...amount }));
+      return { claimed: true, ...amount };
+    }
+
+    // A PROCESSING row is resumable in exactly two cases: it is this attempt's
+    // own claim (same job id, so this is a BullMQ retry picking up where it left
+    // off — its backoff is far shorter than the lease, so it must not be made to
+    // wait one out), or the claim has gone stale and its owner is presumed dead.
+    // Anything else belongs to a worker that may be inside charge() right now.
+    const resumed = await tx.payment.updateMany({
+      where: {
+        invoiceId,
+        organizationId,
+        status: PaymentStatus.PROCESSING,
+        OR: [
+          { claimedBy: claimToken },
+          { processedAt: { lt: new Date(processedAt.getTime() - PAYMENT_CLAIM_LEASE_MS) } },
+          // A row written before this column existed has no owner to compare.
+          { claimedBy: null, processedAt: null },
         ],
       },
-    },
-    data: {
-      status: PaymentStatus.PROCESSING,
-      ...amount,
-      provider: PAYMENT_PROVIDER_NAME,
-      purchaseOrderId: purchaseOrder.id,
-      processedAt,
-      blockedReason: null,
-      failureReason: null,
-    },
+      data: claimData,
+    });
+
+    return { claimed: resumed.count > 0, ...amount };
   });
-
-  if (count === 0) {
-    return { claimed: false, ...amount };
-  }
-
-  await recordPaymentApproved({ organizationId, invoiceId, ...amount });
-
-  return { claimed: true, ...amount };
 }
 
-function recordPaymentApproved(params: {
+function paymentApprovedAudit(params: {
   organizationId: string;
   invoiceId: string;
   amountPaise: number;
   currency: string;
-}): Promise<void> {
-  return recordAudit(prisma, {
+}) {
+  return {
     organizationId: params.organizationId,
-    actorType: "SYSTEM",
-    action: "PAYMENT_APPROVED",
+    actorType: "SYSTEM" as const,
+    action: "PAYMENT_APPROVED" as const,
     entityType: INVOICE_ENTITY,
     entityId: params.invoiceId,
     metadata: { amountPaise: params.amountPaise, currency: params.currency },
-  });
+  };
 }
 
 // ---------------------------------------------------------------------------

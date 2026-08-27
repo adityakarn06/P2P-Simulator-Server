@@ -11,6 +11,7 @@ import {
 } from "../services/payment.service.js";
 import { paymentJobSchema } from "../types/types.js";
 import { AppError, type ErrorCode } from "../utils/AppError.js";
+import { parseJobData } from "./parseJobData.js";
 
 export interface PaymentResult {
   invoiceId: string;
@@ -29,7 +30,7 @@ export interface PaymentResult {
  * attempt, so retrying it would only burn attempts.
  */
 export async function processPaymentJob(job: Job): Promise<PaymentResult> {
-  const { invoiceId, organizationId } = paymentJobSchema.parse(job.data);
+  const { invoiceId, organizationId } = parseJobData(paymentJobSchema, job.data, "payment");
 
   const context = await loadPaymentContext({ organizationId, invoiceId });
   const matchStatus = context.threeWayMatch?.status ?? null;
@@ -55,6 +56,9 @@ export async function processPaymentJob(job: Job): Promise<PaymentResult> {
     organizationId,
     invoiceId,
     purchaseOrder: context.purchaseOrder,
+    // The BullMQ job id is stable across this job's retries, so an interrupted
+    // attempt can resume its own claim without waiting out the lease.
+    claimToken: String(job.id ?? invoiceId),
   });
 
   // Another worker owns this payment, or it settled between the gate and here.

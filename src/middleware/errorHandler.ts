@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { z } from "zod";
+import { env } from "../config/env.js";
 import { Prisma } from "../generated/prisma/client.js";
 import { AppError } from "../utils/AppError.js";
 import { sendError } from "../utils/response.js";
@@ -24,9 +25,15 @@ export function errorHandler(
 
   if (err instanceof Prisma.PrismaClientKnownRequestError) {
     if (err.code === "P2002") {
-      sendError(res, "CONFLICT", "A record with these values already exists", 409, {
-        target: err.meta?.target,
-      });
+      // `target` names the offending column/index. Useful locally, internal
+      // schema detail in production.
+      sendError(
+        res,
+        "CONFLICT",
+        "A record with these values already exists",
+        409,
+        env.NODE_ENV === "production" ? undefined : { target: err.meta?.target },
+      );
       return;
     }
     if (err.code === "P2025") {
@@ -36,7 +43,7 @@ export function errorHandler(
   }
 
   const message =
-    process.env.NODE_ENV === "production"
+    env.NODE_ENV === "production"
       ? "An unexpected error occurred"
       : err instanceof Error
         ? err.message

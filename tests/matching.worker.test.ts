@@ -332,16 +332,35 @@ describe("processMatchingJob — idempotency", () => {
     expect(enqueuePayment).not.toHaveBeenCalled();
   });
 
-  it("claims only from EXTRACTED or MATCHING", async () => {
+  // The claim is split in two so a genuine start (EXTRACTED -> MATCHING) can be
+  // told apart from a resumed attempt (MATCHING -> MATCHING). Only the former
+  // writes MATCH_STARTED, so a redelivered job cannot duplicate that audit row.
+  it("claims a fresh invoice from EXTRACTED and audits the start once", async () => {
     db.invoice.findFirst.mockResolvedValue(buildContext());
 
     await processMatchingJob(buildJob());
 
     const claim = firstArg(db.invoice.updateMany) as {
-      where: { id: string; organizationId: string; status: { in: string[] } };
+      where: { id: string; organizationId: string; status: string };
     };
     expect(claim.where.organizationId).toBe(ORG);
-    expect(claim.where.status.in).toEqual(["EXTRACTED", "MATCHING"]);
+    expect(claim.where.status).toBe("EXTRACTED");
+    expect(auditActions().filter((action) => action === "MATCH_STARTED")).toHaveLength(1);
+  });
+
+  it("resumes an interrupted attempt from MATCHING without re-auditing the start", async () => {
+    db.invoice.findFirst.mockResolvedValue(buildContext());
+    // The EXTRACTED claim finds nothing (a previous attempt already moved it);
+    // the MATCHING claim picks it up.
+    db.invoice.updateMany
+      .mockResolvedValueOnce({ count: 0 })
+      .mockResolvedValueOnce({ count: 1 })
+      .mockResolvedValue({ count: 1 });
+
+    const result = await processMatchingJob(buildJob());
+
+    expect(result.status).toBe("MATCHED");
+    expect(auditActions()).not.toContain("MATCH_STARTED");
   });
 });
 

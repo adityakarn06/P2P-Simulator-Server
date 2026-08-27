@@ -8,7 +8,6 @@ import {
   loadMatchingContext,
   loadPriorInvoices,
   recordMatchingSystemFailure,
-  recordMatchStarted,
   toMatchInput,
 } from "../services/matching.service.js";
 import { matchingJobSchema } from "../types/types.js";
@@ -90,8 +89,6 @@ export async function processMatchingJob(job: Job): Promise<MatchingResult> {
         skippedReason: `Invoice was ${context.status} and could not be claimed for matching`,
       };
     }
-
-    await recordMatchStarted({ organizationId, invoiceId });
 
     const priorInvoices = await loadPriorInvoices({
       organizationId,

@@ -1,5 +1,6 @@
 import { v2 as cloudinary } from "cloudinary";
 import { AppError } from "../utils/AppError.js";
+import { withTimeout } from "../utils/withTimeout.js";
 import type {
   AllowedMimeType,
   StorageProvider,
@@ -46,6 +47,15 @@ const DOWNLOAD_LINK_TTL_SECONDS = 300;
  * actually fails. Mirrors the timeout the Gemini provider applies.
  */
 const DOWNLOAD_TIMEOUT_MS = 30_000;
+
+/**
+ * The same ceiling on the write and cleanup paths. Cloudinary's SDK takes a
+ * callback rather than an AbortSignal, so this cannot cancel the request the
+ * way download() does — but it does stop a hung upload from pinning a BullMQ
+ * concurrency slot (or an Express socket) open indefinitely.
+ */
+const UPLOAD_TIMEOUT_MS = 60_000;
+const DELETE_TIMEOUT_MS = 15_000;
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -125,29 +135,33 @@ export class CloudinaryStorage implements StorageProvider {
     const publicId = buildPublicId(input.invoiceId, input.fileName);
 
     try {
-      const result = await new Promise<{
-        public_id: string;
-        secure_url: string;
-        bytes: number;
-        format?: string;
-      }>((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          {
-            public_id: publicId,
-            resource_type: "auto",
-            type: "authenticated",
-            overwrite: false,
-          },
-          (error, uploadResult) => {
-            if (error || !uploadResult) {
-              reject(error ?? new Error("Cloudinary upload returned no result"));
-              return;
-            }
-            resolve(uploadResult);
-          },
-        );
-        stream.end(input.buffer);
-      });
+      const result = await withTimeout(
+        new Promise<{
+          public_id: string;
+          secure_url: string;
+          bytes: number;
+          format?: string;
+        }>((resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            {
+              public_id: publicId,
+              resource_type: "auto",
+              type: "authenticated",
+              overwrite: false,
+            },
+            (error, uploadResult) => {
+              if (error || !uploadResult) {
+                reject(error ?? new Error("Cloudinary upload returned no result"));
+                return;
+              }
+              resolve(uploadResult);
+            },
+          );
+          stream.end(input.buffer);
+        }),
+        UPLOAD_TIMEOUT_MS,
+        "Cloudinary upload timed out",
+      );
 
       const expectedFormat = formatForMimeType(input.mimeType);
 
@@ -241,7 +255,11 @@ export class CloudinaryStorage implements StorageProvider {
    */
   async delete(storageKey: string): Promise<void> {
     try {
-      await cloudinary.uploader.destroy(storageKey, { type: "authenticated", invalidate: true });
+      await withTimeout(
+        cloudinary.uploader.destroy(storageKey, { type: "authenticated", invalidate: true }),
+        DELETE_TIMEOUT_MS,
+        "Cloudinary delete timed out",
+      );
     } catch (error) {
       throw AppError.dependencyUnavailable("Failed to delete document from Cloudinary", {
         cause: error instanceof Error ? error.message : error,

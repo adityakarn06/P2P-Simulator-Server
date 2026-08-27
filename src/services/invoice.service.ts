@@ -584,8 +584,10 @@ export async function applyInvoiceExtraction(params: {
           lineNumber: index + 1,
           description: item.description,
           quantity: item.quantity,
-          unitPricePaise: toPaise(item.unitPrice) ?? 0,
-          lineTotalPaise: toPaise(item.lineTotal) ?? 0,
+          // Null, never 0: a figure the document did not print is not a price
+          // of zero, and matching must be able to tell those apart.
+          unitPricePaise: toPaise(item.unitPrice),
+          lineTotalPaise: toPaise(item.lineTotal),
         })),
       });
     }

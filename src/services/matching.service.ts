@@ -238,28 +238,41 @@ export async function claimInvoiceForMatching(params: {
   organizationId: string;
   invoiceId: string;
 }): Promise<boolean> {
-  const { count } = await prisma.invoice.updateMany({
-    where: {
-      id: params.invoiceId,
-      organizationId: params.organizationId,
-      status: { in: [InvoiceStatus.EXTRACTED, InvoiceStatus.MATCHING] },
-    },
-    data: { status: InvoiceStatus.MATCHING },
-  });
+  return prisma.$transaction(async (tx) => {
+    // Split into two guarded updates so a genuine start can be told apart from
+    // a resumed attempt. MATCH_STARTED is written in the same transaction, and
+    // only on the EXTRACTED -> MATCHING edge, so a redelivered job that resumes
+    // its own interrupted attempt does not append a second audit row.
+    const fresh = await tx.invoice.updateMany({
+      where: {
+        id: params.invoiceId,
+        organizationId: params.organizationId,
+        status: InvoiceStatus.EXTRACTED,
+      },
+      data: { status: InvoiceStatus.MATCHING },
+    });
 
-  return count > 0;
-}
+    if (fresh.count > 0) {
+      await recordAudit(tx, {
+        organizationId: params.organizationId,
+        actorType: "SYSTEM",
+        action: "MATCH_STARTED",
+        entityType: INVOICE_ENTITY,
+        entityId: params.invoiceId,
+      });
+      return true;
+    }
 
-export function recordMatchStarted(params: {
-  organizationId: string;
-  invoiceId: string;
-}): Promise<void> {
-  return recordAudit(prisma, {
-    organizationId: params.organizationId,
-    actorType: "SYSTEM",
-    action: "MATCH_STARTED",
-    entityType: INVOICE_ENTITY,
-    entityId: params.invoiceId,
+    const resumed = await tx.invoice.updateMany({
+      where: {
+        id: params.invoiceId,
+        organizationId: params.organizationId,
+        status: InvoiceStatus.MATCHING,
+      },
+      data: { status: InvoiceStatus.MATCHING },
+    });
+
+    return resumed.count > 0;
   });
 }
 
