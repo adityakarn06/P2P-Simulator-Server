@@ -1,0 +1,16 @@
+node_modules
+dist
+.git
+.github
+.env
+.env.*
+*.log
+.pnpm-store
+coverage
+trash
+tests
+api-docs
+.claude
+.agents
+.windsurf
+src/generated
