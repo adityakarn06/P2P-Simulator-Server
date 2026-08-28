@@ -85,6 +85,30 @@ describe("buildPublicId", () => {
   it("strips the file extension", () => {
     expect(buildPublicId("inv-1", "photo.invoice.png")).toBe("p2p/invoices/inv-1/photo.invoice");
   });
+
+  // originalname comes straight from the multipart headers, so the storage key
+  // must not be able to escape the per-invoice folder.
+  it.each([
+    ["../../evil.pdf", "p2p/invoices/inv-1/evil"],
+    ["a/b.pdf", "p2p/invoices/inv-1/a_b"],
+    ["/etc/passwd.pdf", "p2p/invoices/inv-1/etc_passwd"],
+    // Percent-encoded separators are not decoded anywhere, but the "%" is
+    // still outside the safe set, so the name cannot carry one through.
+    ["..%2f..%2fx.pdf", "p2p/invoices/inv-1/2f__2fx"],
+  ])("neutralises %s", (fileName, expected) => {
+    expect(buildPublicId("inv-1", fileName)).toBe(expected);
+  });
+
+  it("keeps the key valid when nothing survives sanitisation", () => {
+    expect(buildPublicId("inv-1", "///.pdf")).toBe("p2p/invoices/inv-1/document");
+  });
+
+  it("caps a very long name so the key stays a sane length", () => {
+    const key = buildPublicId("inv-1", `${"a".repeat(500)}.pdf`);
+
+    expect(key.startsWith("p2p/invoices/inv-1/")).toBe(true);
+    expect(key.length).toBeLessThanOrEqual("p2p/invoices/inv-1/".length + 64);
+  });
 });
 
 describe("CloudinaryStorage", () => {

@@ -1,4 +1,5 @@
 import { type Queue, QueueEvents } from "bullmq";
+import type { Redis } from "ioredis";
 import { createRedisConnection } from "../config/redis.js";
 
 /**
@@ -12,12 +13,21 @@ import { createRedisConnection } from "../config/redis.js";
 
 const eventsByQueue = new Map<string, QueueEvents>();
 
+// QueueEvents blocks on XREAD, so it needs a worker-style connection
+// (maxRetriesPerRequest: null), not the shared producer one. It also
+// duplicates whatever instance it is handed, so this template is created
+// lazily and never dials Redis itself — only the duplicates do.
+let eventsConnectionTemplate: Redis | null = null;
+
+function getEventsConnectionTemplate(): Redis {
+  eventsConnectionTemplate ??= createRedisConnection({ lazyConnect: true });
+  return eventsConnectionTemplate;
+}
+
 function getQueueEvents(queueName: string): QueueEvents {
   let events = eventsByQueue.get(queueName);
   if (!events) {
-    // QueueEvents blocks on XREAD, so it needs a worker-style connection
-    // (maxRetriesPerRequest: null), not the shared producer one.
-    events = new QueueEvents(queueName, { connection: createRedisConnection() });
+    events = new QueueEvents(queueName, { connection: getEventsConnectionTemplate() });
     eventsByQueue.set(queueName, events);
   }
   return events;
@@ -55,4 +65,8 @@ export async function awaitJobResult<T>(
 export async function closeQueueEvents(): Promise<void> {
   await Promise.all([...eventsByQueue.values()].map((events) => events.close()));
   eventsByQueue.clear();
+  // Never connected (lazyConnect), so disconnect() rather than quit() — there
+  // is no socket to send QUIT on.
+  eventsConnectionTemplate?.disconnect();
+  eventsConnectionTemplate = null;
 }

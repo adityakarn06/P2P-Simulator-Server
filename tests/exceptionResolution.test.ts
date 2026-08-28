@@ -190,4 +190,28 @@ describe("resolveExceptionById — guards", () => {
 
     await expect(resolve("APPROVE")).resolves.toMatchObject({ releasedForPayment: true });
   });
+
+  it("refuses a PO_APPROVAL_REQUIRED exception, which the purchase order owns", async () => {
+    db.exception.findFirst.mockResolvedValue(
+      buildException({
+        type: "PO_APPROVAL_REQUIRED",
+        entityType: "PurchaseOrder",
+        entityId: "po-1",
+      }),
+    );
+
+    // Resolving it here would close the exception while leaving the purchase
+    // order in PENDING_APPROVAL with nothing open against it.
+    await expect(resolve("APPROVE")).rejects.toThrow(/purchase-order/i);
+    expect(db.exception.updateMany).not.toHaveBeenCalled();
+    expect(db.invoice.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("scopes the status transition by organization, not only the preceding read", async () => {
+    await resolve("APPROVE");
+
+    expect(db.exception.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { id: EXCEPTION, organizationId: ORG },
+    });
+  });
 });

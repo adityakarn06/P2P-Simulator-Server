@@ -17,8 +17,18 @@ export function createApp(): Express {
     app.set("trust proxy", env.TRUST_PROXY_HOPS);
   }
 
-  app.use(helmet());
-  app.use(cors({ origin: env.CORS_ORIGIN, credentials: true }));
+  // crossOriginResourcePolicy is relaxed to match the wide-open CORS below:
+  // helmet's "same-origin" default makes the browser refuse cross-origin
+  // *resource* loads, which would block a frontend embedding or downloading a
+  // generated invoice PDF from this API. Everything else keeps helmet's
+  // defaults.
+  app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+  // Wide open on purpose: this is a no-auth hackathon MVP with no cookies and
+  // no Authorization header (src/middleware/auth.ts attaches a fixed dev
+  // tenant), so there is no credentialed request for an origin allowlist to
+  // protect. `credentials: true` is deliberately absent — browsers reject it
+  // alongside `Access-Control-Allow-Origin: *`.
+  app.use(cors({ origin: "*" }));
   app.use(express.json({ limit: "1mb" }));
 
   app.use(rootRouter);

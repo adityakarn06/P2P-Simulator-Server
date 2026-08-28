@@ -1,5 +1,5 @@
 import type { Job } from "bullmq";
-import { PaymentStatus } from "../generated/prisma/enums.js";
+import { InvoiceStatus, PaymentStatus } from "../generated/prisma/enums.js";
 import { getPaymentProvider } from "../payments/index.js";
 import { evaluatePayment, isOverriddenPayment } from "../rules/paymentRules.js";
 import { countOpenExceptions } from "../services/exception.service.js";
@@ -7,7 +7,9 @@ import {
   applyPaymentCompletion,
   applyPaymentFailure,
   claimPaymentForProcessing,
+  hasSettledSiblingInvoice,
   loadPaymentContext,
+  recordDuplicatePurchaseOrderPayment,
 } from "../services/payment.service.js";
 import { paymentJobSchema } from "../types/types.js";
 import { AppError, type ErrorCode } from "../utils/AppError.js";
@@ -34,17 +36,41 @@ export async function processPaymentJob(job: Job): Promise<PaymentResult> {
 
   const context = await loadPaymentContext({ organizationId, invoiceId });
   const matchStatus = context.threeWayMatch?.status ?? null;
-  const openExceptionCount = await countOpenExceptions({ organizationId, entityId: invoiceId });
+
+  // Independent reads — run them together rather than one after the other.
+  const [openExceptionCount, purchaseOrderAlreadySettled] = await Promise.all([
+    countOpenExceptions({ organizationId, entityId: invoiceId }),
+    hasSettledSiblingInvoice({
+      organizationId,
+      invoiceId,
+      purchaseOrderId: context.purchaseOrder.id,
+    }),
+  ]);
 
   const decision = evaluatePayment({
     invoiceStatus: context.status,
     matchStatus,
     paymentStatus: context.payment?.status ?? null,
     openExceptionCount,
+    purchaseOrderAlreadySettled,
   });
 
   if (!decision.payable) {
     console.log(`Invoice ${invoiceId}: not paying — ${decision.reason}`);
+
+    // A sibling invoice having taken the money is the one refusal a human has
+    // to see: two documents were raised against one order. Every other reason
+    // here is already visible in the invoice's own status.
+    if (purchaseOrderAlreadySettled && context.status === InvoiceStatus.APPROVED) {
+      await recordDuplicatePurchaseOrderPayment({
+        organizationId,
+        invoiceId,
+        purchaseOrderId: context.purchaseOrder.id,
+        poNumber: context.purchaseOrder.poNumber,
+        reason: decision.reason,
+      });
+    }
+
     return {
       invoiceId,
       status: context.payment?.status ?? null,

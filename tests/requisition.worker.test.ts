@@ -42,6 +42,7 @@ const applyFallbackClarification = vi.fn();
 const applyExtractionResult = vi.fn();
 
 vi.mock("../src/services/requisition.service.js", () => ({
+  CLOSED_STATUSES: ["REQUIREMENTS_EXTRACTED", "SUPPLIER_SELECTED", "PO_CREATED", "FAILED"],
   loadRequisitionForProcessing: (...a: unknown[]) => loadRequisitionForProcessing(...a),
   applyFallbackClarification: (...a: unknown[]) => applyFallbackClarification(...a),
   applyExtractionResult: (...a: unknown[]) => applyExtractionResult(...a),
@@ -131,5 +132,51 @@ describe("processRequisitionJob — systemic AI failure", () => {
     await processRequisitionJob(buildJob(2));
 
     expect(exceptionTypes()).toEqual(["SYSTEM_FAILURE"]);
+  });
+});
+
+describe("processRequisitionJob — re-delivery guards", () => {
+  it.each(["SUPPLIER_SELECTED", "PO_CREATED", "FAILED"])(
+    "returns early for a %s requisition without calling Gemini",
+    async (status) => {
+      loadRequisitionForProcessing.mockResolvedValue({
+        id: REQ,
+        organizationId: ORG,
+        status,
+        rawInput: "I need 100 wireless keyboards",
+        clarificationMessage: null,
+        messages: [],
+      });
+
+      const result = await processRequisitionJob(buildJob());
+
+      // Re-running extraction here would rewind a requisition that already has
+      // a supplier or a purchase order, and re-queue supplier discovery behind it.
+      expect(result.status).toBe(status);
+      expect(generateStructured).not.toHaveBeenCalled();
+      expect(applyExtractionResult).not.toHaveBeenCalled();
+      expect(enqueueSupplierDiscovery).not.toHaveBeenCalled();
+    },
+  );
+
+  it("still re-enqueues discovery for a REQUIREMENTS_EXTRACTED requisition", async () => {
+    loadRequisitionForProcessing.mockResolvedValue({
+      id: REQ,
+      organizationId: ORG,
+      status: "REQUIREMENTS_EXTRACTED",
+      rawInput: "I need 100 wireless keyboards",
+      clarificationMessage: "Got it.",
+      messages: [],
+    });
+
+    // Discovery is enqueued after the extraction transaction commits, so this
+    // heals the gap left by a Redis failure in that window.
+    await processRequisitionJob(buildJob());
+
+    expect(enqueueSupplierDiscovery).toHaveBeenCalledWith({
+      requisitionId: REQ,
+      organizationId: ORG,
+    });
+    expect(generateStructured).not.toHaveBeenCalled();
   });
 });

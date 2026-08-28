@@ -24,8 +24,9 @@ supplier-discovery worker       ──▶ SUPPLIER_SELECTED   sourcing + supplie
 GET /requisitions/:id           ──▶ client polls for the outcome
 ```
 
-The client never triggers discovery. After `POST /requisitions` (or `.../messages`) returns with
-`requirements != null`, poll `GET /requisitions/:id` until `status` leaves `REQUIREMENTS_EXTRACTED`.
+The client never triggers discovery. After `POST /requisitions` (or `.../messages`) returns
+`status: "REQUIREMENTS_EXTRACTED"` (equivalently, `requirements != null`), poll
+`GET /requisitions/:id` until `status` leaves `REQUIREMENTS_EXTRACTED`.
 
 ## Status lifecycle
 

@@ -68,3 +68,57 @@ export const MATCH_TOLERANCES = {
   TAX_PERCENTAGE: 0.01,
   TOTAL_PERCENTAGE: 0.01,
 } as const;
+
+/**
+ * Supplier delivery-performance scoring (src/rules/supplierPerformance.ts).
+ *
+ * The three weights sum to 1 and produce the 0-1 reliabilityScore that carries
+ * the RELIABILITY weight in SUPPLIER_SCORE_WEIGHTS above — so a supplier's
+ * measured behaviour feeds directly back into who wins the next requisition.
+ */
+export const SUPPLIER_PERFORMANCE = {
+  ON_TIME_WEIGHT: 0.5,
+  IN_FULL_WEIGHT: 0.3,
+  QUALITY_WEIGHT: 0.2,
+  /**
+   * Shrinkage prior, in pseudo-deliveries. The seeded score counts for this
+   * many observations, so one bad delivery moves the score without destroying
+   * the supplier and sustained evidence still wins. Five keeps the demo's
+   * ranking legible: a single short delivery is visible but not catastrophic.
+   */
+  PRIOR_WEIGHT: 5,
+} as const;
+
+/**
+ * Thresholds for the advisory anomaly signals (src/rules/anomalyDetection.ts).
+ *
+ * These gate *observations*, never decisions: no signal can block a payment or
+ * change a match verdict, so a threshold set too loosely costs noise on a
+ * dashboard rather than money.
+ */
+export const ANOMALY_THRESHOLDS = {
+  /**
+   * A distribution needs enough history to mean anything. Below this many prior
+   * observations no outlier signal fires at all — with two samples every third
+   * one looks like an outlier.
+   */
+  MIN_HISTORY: 3,
+  /** |z| above which a price or quantity is called an outlier. */
+  Z_SCORE: 2,
+  /**
+   * A σ of zero (every prior identical) makes a z-score infinite, so identical
+   * history falls back to a relative-deviation test at this ratio instead.
+   */
+  FLAT_HISTORY_DEVIATION: 0.15,
+  /** A first-ever order with a supplier above this is worth a second look. */
+  NEW_SUPPLIER_VALUE_PAISE: 500_000_00,
+  /** Window for the fuzzy duplicate-invoice signal, in days. */
+  NEAR_DUPLICATE_WINDOW_DAYS: 30,
+  /**
+   * How far measured lead time may exceed the quoted delivery before a late
+   * delivery is predicted, as a ratio of the quote. 0.2 = 20% slower than promised.
+   */
+  LATE_DELIVERY_RATIO: 0.2,
+  /** Drop in reliabilityScore against the seeded baseline that counts as degradation. */
+  DEGRADATION_DROP: 0.15,
+} as const;

@@ -122,6 +122,39 @@ enum MatchCheckType {
   DUPLICATE_INVOICE
 }
 
+/**
+ * Advisory signals raised by src/rules/anomalyDetection.ts.
+ * Deliberately a separate vocabulary from ExceptionType: an Exception blocks
+ * payment (evaluatePayment counts open ones), a signal never does. A signal
+ * says "a human might want to look at this", not "this invoice is wrong".
+ */
+enum AnomalySignalType {
+  /**
+   * Unit price far from what this supplier has historically charged for this product.
+   */
+  PRICE_OUTLIER
+  /**
+   * Requisition quantity far from the organization's own history for this product.
+   */
+  QUANTITY_OUTLIER
+  /**
+   * First purchase order with a supplier, above a value threshold.
+   */
+  NEW_SUPPLIER_HIGH_VALUE
+  /**
+   * Same supplier, same total, different invoice number, within a short window.
+   */
+  NEAR_DUPLICATE_INVOICE
+  /**
+   * The predictive one: the supplier's measured lead time exceeds the delivery they quoted.
+   */
+  PREDICTED_LATE_DELIVERY
+  /**
+   * The supplier's reliability score has fallen materially against its own baseline.
+   */
+  SUPPLIER_DEGRADATION
+}
+
 enum Severity {
   INFO
   WARNING
@@ -160,6 +193,7 @@ enum AuditAction {
   PAYMENT_COMPLETED
   WORKFLOW_FAILED
   INVOICE_GENERATED
+  SUPPLIER_PERFORMANCE_UPDATED
 }
 
 // ---------------------------------------------------------------------------
@@ -185,19 +219,58 @@ model Organization {
   exceptions         Exception[]
   auditLogs          AuditLog[]
   aiProcessingLogs   AIProcessingLog[]
+  anomalySignals     AnomalySignal[]
   supplierCandidates SupplierCandidate[]
   sourcingDecisions  SourcingDecision[]
 }
 
 model Supplier {
-  id               String  @id @default(cuid())
-  organizationId   String
-  name             String
-  email            String?
-  phone            String?
-  rating           Float // 0-5
-  reliabilityScore Float // 0-1
-  isActive         Boolean @default(true)
+  id                  String  @id @default(cuid())
+  organizationId      String
+  name                String
+  email               String?
+  phone               String?
+  rating              Float // 0-5
+  /**
+   * 0-1, and 20% of the sourcing score (src/rules/supplierRanking.ts). Seeded
+   * once, then recomputed from actual delivery outcomes every time a goods
+   * receipt is booked — see src/rules/supplierPerformance.ts. The counters
+   * below are the raw evidence behind it; this is the derived figure.
+   */
+  reliabilityScore    Float // 0-1
+  /**
+   * The score this supplier was onboarded with. Never recomputed — it is the
+   * fixed prior that reliabilityScore shrinks toward while the delivery history
+   * is thin, and the baseline SUPPLIER_DEGRADATION measures a fall against.
+   * Shrinking toward the *current* score instead would make the update
+   * recursive and let the score drift with nothing anchoring it.
+   */
+  baselineReliability Float?
+  isActive            Boolean @default(true)
+
+  // ---- Delivery performance (OTIF). Maintained by recordGoodsReceipt only, ----
+  // exactly once per receipt, inside the transaction that creates it.
+  /**
+   * /**
+   * /** Receipts booked against this supplier. The denominator for every rate below.
+   */
+  totalDeliveries  Int       @default(0)
+  /**
+   * Deliveries where deliveredAt <= the shipment's expectedDeliveryDate.
+   */
+  onTimeDeliveries Int       @default(0)
+  /**
+   * Deliveries where every ordered unit was accepted (nothing short, nothing damaged).
+   */
+  inFullDeliveries Int       @default(0)
+  orderedUnits     Int       @default(0)
+  acceptedUnits    Int       @default(0)
+  damagedUnits     Int       @default(0)
+  /**
+   * Running mean of actual lead time, in days from PO approval to delivery.
+   */
+  avgLeadTimeDays  Float?
+  lastDeliveryAt   DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -737,5 +810,44 @@ model AIProcessingLog {
 
   @@index([organizationId])
   @@index([organizationId, jobType])
+  @@index([entityType, entityId])
+}
+
+/**
+ * One advisory anomaly signal. Written by the purchase-order and matching
+ * workers after the decision they observe has already been made and persisted,
+ * so computing them can never change a financial outcome.
+ * Never an Exception: evaluatePayment (src/rules/paymentRules.ts) refuses to
+ * pay while an exception is open, so filing a signal there would silently
+ * block money on a heuristic. Deterministic rules decide; signals only inform.
+ */
+model AnomalySignal {
+  id             String            @id @default(cuid())
+  organizationId String
+  signalType     AnomalySignalType
+  severity       Severity
+  entityType     String
+  entityId       String
+  /**
+   * Sortable magnitude — a z-score, or a ratio for the rules that have no distribution.
+   */
+  score          Float
+  /**
+   * Formatted for display. Never parsed back into a number, never used in a calculation.
+   */
+  observed       String
+  baseline       String
+  explanation    String
+  metadata       Json?
+
+  createdAt DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  // A re-delivered job re-derives the same signal from the same history; the
+  // upsert against this constraint is what keeps the feed from filling up.
+  @@unique([organizationId, signalType, entityType, entityId])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, severity])
   @@index([entityType, entityId])
 }

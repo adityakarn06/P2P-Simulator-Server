@@ -297,11 +297,12 @@ describe("processSupplierDiscoveryJob — no eligible supplier", () => {
     expect(result.reason).toContain("No supplier met every requirement");
     expect(result.reason).toContain("Stock 3 is below the required 10");
 
-    expect(db.requisition.update).toHaveBeenCalledWith(
-      expect.objectContaining({
-        data: expect.objectContaining({ status: "FAILED", failureReason: result.reason }),
-      }),
-    );
+    // Guarded on REQUIREMENTS_EXTRACTED and scoped by organization: a late
+    // delivery must not be able to FAIL a requisition that has moved on.
+    expect(db.requisition.updateMany).toHaveBeenCalledWith({
+      where: { id: REQ, organizationId: ORG, status: "REQUIREMENTS_EXTRACTED" },
+      data: { status: "FAILED", failureReason: result.reason },
+    });
     expect(db.exception.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         where: {
@@ -462,6 +463,28 @@ describe("processSupplierDiscoveryJob — idempotency and state guards", () => {
     expect(enqueuePurchaseOrder).not.toHaveBeenCalled();
   });
 
+  it("does not FAIL a requisition that already has a purchase order", async () => {
+    db.requisition.findFirst.mockResolvedValue({
+      id: REQ,
+      organizationId: ORG,
+      status: "REQUIREMENTS_EXTRACTED",
+      requirement: requirement(),
+    });
+    db.supplierProduct.findMany.mockResolvedValue([]);
+    // The guarded claim finds nothing to move: the requisition was sourced and
+    // turned into a purchase order while this stale job was in flight.
+    db.requisition.updateMany.mockResolvedValue({ count: 0 });
+
+    const result = await processSupplierDiscoveryJob(job());
+
+    expect(result.skipped).toBe(true);
+    // The whole failure transaction is abandoned — no bogus exception, no audit
+    // row, and the candidates of the live decision are left alone.
+    expect(db.exception.upsert).not.toHaveBeenCalled();
+    expect(db.supplierCandidate.deleteMany).not.toHaveBeenCalled();
+    expect(auditActions()).toEqual([]);
+  });
+
   it("skips a requisition that is not ready for sourcing", async () => {
     for (const status of ["NEEDS_CLARIFICATION", "PROCESSING", "FAILED", "CREATED"]) {
       vi.clearAllMocks();
@@ -475,7 +498,7 @@ describe("processSupplierDiscoveryJob — idempotency and state guards", () => {
       const result = await processSupplierDiscoveryJob(job());
 
       expect(result).toMatchObject({ status, skipped: true, selectedSupplierId: null });
-      expect(db.requisition.update).not.toHaveBeenCalled();
+      expect(db.requisition.updateMany).not.toHaveBeenCalled();
       expect(db.exception.upsert).not.toHaveBeenCalled();
       expect(enqueuePurchaseOrder).not.toHaveBeenCalled();
     }
@@ -492,7 +515,9 @@ describe("processSupplierDiscoveryJob — idempotency and state guards", () => {
 
     await processSupplierDiscoveryJob(job());
 
-    expect(db.supplierCandidate.deleteMany).toHaveBeenCalledWith({ where: { requisitionId: REQ } });
+    expect(db.supplierCandidate.deleteMany).toHaveBeenCalledWith({
+      where: { requisitionId: REQ, organizationId: ORG },
+    });
     const deleteOrder = db.supplierCandidate.deleteMany.mock.invocationCallOrder[0] ?? 0;
     const createOrder = db.supplierCandidate.createMany.mock.invocationCallOrder[0] ?? 0;
     expect(deleteOrder).toBeLessThan(createOrder);

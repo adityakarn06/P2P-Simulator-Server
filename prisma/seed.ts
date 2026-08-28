@@ -197,11 +197,24 @@ async function main(): Promise<void> {
   for (const supplier of Object.values(SUPPLIERS)) {
     await prisma.supplier.upsert({
       where: { id: supplier.id },
+      // Re-seeding resets the whole performance record, not just the score:
+      // leaving stale counters behind would make a re-seeded supplier look
+      // like it had a delivery history it no longer has, and the shrinkage
+      // prior in src/rules/supplierPerformance.ts would weight it accordingly.
       update: {
         name: supplier.name,
         email: supplier.email,
         rating: supplier.rating,
         reliabilityScore: supplier.reliabilityScore,
+        baselineReliability: supplier.reliabilityScore,
+        totalDeliveries: 0,
+        onTimeDeliveries: 0,
+        inFullDeliveries: 0,
+        orderedUnits: 0,
+        acceptedUnits: 0,
+        damagedUnits: 0,
+        avgLeadTimeDays: null,
+        lastDeliveryAt: null,
       },
       create: {
         id: supplier.id,
@@ -210,6 +223,7 @@ async function main(): Promise<void> {
         email: supplier.email,
         rating: supplier.rating,
         reliabilityScore: supplier.reliabilityScore,
+        baselineReliability: supplier.reliabilityScore,
       },
     });
   }

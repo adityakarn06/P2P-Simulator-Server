@@ -81,7 +81,67 @@ pnpm test
 ```
 
 Unit tests cover the deterministic rule modules directly (`supplierRanking`, `approvalRules`,
-`threeWayMatch`, `paymentRules`, `receiptRules`) plus worker- and service-level tests for each queue
-consumer (`tests/*.worker.test.ts`) and the exception resolution flow
+`threeWayMatch`, `paymentRules`, `receiptRules`, `supplierPerformance`, `anomalyDetection`) plus
+worker- and service-level tests for each queue consumer (`tests/*.worker.test.ts`), the analytics
+endpoints (`tests/analytics.api.test.ts`), and the exception resolution flow
 (`tests/exceptionResolution.test.ts`). Gemini, Cloudinary, and the payment provider are mocked in
 every automated test — nothing in `pnpm test` calls a live external service.
+
+Thinnest coverage today is the conversational requisition flow: `tests/requisition.worker.test.ts`
+has four cases, there is no API-level test for `POST /requisitions` or `POST /:id/messages`, and
+`src/rules/requirementRules.ts` (`mergeDraft`, correction and conflict handling) is untested.
+
+## Supplier performance and analytics
+
+Two loops sit on top of the core workflow.
+
+**The OTIF loop.** Every goods receipt folds a delivery into the supplier's record — on time, in
+full, damage rate, lead time — and recomputes `Supplier.reliabilityScore`
+(`src/rules/supplierPerformance.ts`). That score carries 20% of the sourcing weight in
+`src/rules/supplierRanking.ts`, so a supplier that delivers late or short ranks lower on the *next*
+requisition without anybody editing a row. The score is shrunk toward `baselineReliability` — what
+the supplier was onboarded with — so one bad delivery moves it without destroying the vendor.
+Counters move through atomic increments inside the receipt's own transaction, and only on the branch
+that actually creates the receipt, so a replayed delivery cannot be counted twice.
+
+**Advisory anomaly signals.** `src/rules/anomalyDetection.ts` compares each purchase order and
+invoice against the organization's own history — price outliers, quantity outliers, large first
+orders, predicted late delivery, near-duplicate invoices, supplier degradation. Deterministic
+statistics (mean and σ), not a model.
+
+These signals are advisory and that is load-bearing: they live in their own `AnomalySignal` table
+and can never block a payment, raise an `Exception`, or change a match verdict.
+`src/rules/threeWayMatch.ts` stays the only financial gate and `src/rules/paymentRules.ts` the only
+payment one — filing a heuristic as an `Exception` would silently block money, because
+`evaluatePayment` refuses to pay while one is open.
+
+Both surface through `GET /api/v1/analytics/{summary,suppliers,anomalies}` — see
+[`api-docs/analytics-api.md`](./api-docs/analytics-api.md). The summary's headline touchless rate is
+**invoice-side**: PO approval is deliberately a human step in this build
+(`PO_AUTO_APPROVE_ENABLED` is `false`), so an end-to-end figure would be zero by construction and
+would say nothing about how well the automation works. Label it that way in any UI.
+
+## Known gaps
+
+Deliberate, but worth knowing before you build on them.
+
+- **`x-organization-id` is trusted verbatim.** `src/middleware/auth.ts` reads the header with no
+  verification, so any client can act as any tenant. Every tenant-scoping guarantee downstream rests
+  on that header — this is fine for the no-auth MVP and is the first thing to fix when auth lands.
+- **`CLAUDE.md` describes some things this repo deliberately did not build**: S3 (the code is
+  Cloudinary-only, behind `StorageProvider`), Clerk, Socket.IO, and a structured logger. Polling and
+  `console.log` are the reality; see the note at the top of `CLAUDE.md`.
+- **A purchase order never closes.** `PurchaseOrderStatus.SHIPPED` and `COMPLETED` are never
+  written — a PO stops at `RECEIVED` even after its invoice is paid. In supply-chain terms that
+  means there is no open-commitment figure.
+- **`ShipmentStatus.CREATED` is never written** — approval inserts the shipment directly at
+  `IN_TRANSIT`. `ExceptionType.REQUIREMENT_INCOMPLETE` is likewise never raised; incomplete
+  requirements are handled conversationally instead.
+- **`PO_NUMBER` and `PRODUCT` match failures fall through to `SYSTEM_FAILURE`**, because no
+  `ExceptionType` describes them. Documented in `threeWayMatch.ts`, but it does mislabel a business
+  problem as a technical one on the exceptions screen.
+- **Exception `REJECT` is a dead end.** The invoice stays `EXCEPTION` with a `BLOCKED` payment and
+  no further path — no re-match, no partial settlement, no credit note.
+- **Requisitions are single-line.** `src/zod/requisition.schema.ts` carries one `productName` and
+  one `quantity`. Purchase orders, receipts and three-way matching all already handle multiple
+  lines; only intake is constrained.

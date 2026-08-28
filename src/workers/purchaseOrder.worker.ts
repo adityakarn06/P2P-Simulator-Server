@@ -4,6 +4,7 @@ import type { Prisma } from "../generated/prisma/client.js";
 import { ExceptionType, RequisitionStatus } from "../generated/prisma/enums.js";
 import { calculatePurchaseOrderTotals, decideApprovalStatus } from "../rules/approvalRules.js";
 import { checkEligibility, type SourcingConstraints } from "../rules/supplierRanking.js";
+import { evaluatePurchaseOrder } from "../services/anomaly.service.js";
 import {
   addDays,
   applyPurchaseOrderCreation,
@@ -242,6 +243,11 @@ async function createPurchaseOrder(requisition: RequisitionForPO): Promise<Purch
     expectedDeliveryDate: addDays(now, offer.deliveryDays),
     items: totals.items,
   });
+
+  // Advisory only, and deliberately after the order is committed: anomaly
+  // signals inform a buyer, they never gate a purchase order. The service
+  // swallows its own failures so this cannot fail the job.
+  await evaluatePurchaseOrder({ organizationId, purchaseOrderId: purchaseOrder.id });
 
   return {
     requisitionId,

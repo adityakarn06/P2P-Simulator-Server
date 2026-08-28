@@ -1,6 +1,7 @@
 import type { Job } from "bullmq";
 import { AI_MODEL, getAIProvider } from "../ai/index.js";
 import { INVOICE_PROMPT_VERSION, INVOICE_SYSTEM_PROMPT } from "../ai/prompts/invoice.v1.js";
+import type { Prisma } from "../generated/prisma/client.js";
 import { InvoiceSource, InvoiceStatus } from "../generated/prisma/enums.js";
 import { INVOICE_JOBS } from "../queues/invoice.queue.js";
 import { enqueueMatching } from "../queues/matching.queue.js";
@@ -9,6 +10,7 @@ import {
   applyInvoiceExtraction,
   applyInvoiceExtractionFailure,
   claimInvoiceForExtraction,
+  countExtractionRetry,
   isExtracted,
   loadInvoiceForProcessing,
 } from "../services/invoice.service.js";
@@ -85,6 +87,12 @@ export async function processInvoiceJob(job: Job): Promise<InvoiceProcessingResu
     };
   }
 
+  if (!claimed) {
+    // Resuming an attempt the claim above could not count, because the invoice
+    // was already PROCESSING. Without this the column under-reports every retry.
+    await countExtractionRetry({ organizationId, invoiceId });
+  }
+
   const startedAt = Date.now();
   let raw: string;
 
@@ -124,7 +132,7 @@ export async function processInvoiceJob(job: Job): Promise<InvoiceProcessingResu
     organizationId,
     invoiceId,
     result: parsed.value,
-    raw: JSON.parse(raw),
+    raw: parsed.json,
   });
 
   // Enqueued after the transaction commits, never inside it.
@@ -133,7 +141,9 @@ export async function processInvoiceJob(job: Job): Promise<InvoiceProcessingResu
   return { invoiceId, status: updated.status };
 }
 
-type ParseOutcome = { ok: true; value: InvoiceExtraction } | { ok: false; reason: string };
+type ParseOutcome =
+  | { ok: true; value: InvoiceExtraction; json: Prisma.InputJsonValue }
+  | { ok: false; reason: string };
 
 function safeParseExtraction(raw: string): ParseOutcome {
   let json: unknown;
@@ -153,7 +163,10 @@ function safeParseExtraction(raw: string): ParseOutcome {
     };
   }
 
-  return { ok: true, value: parsed.data };
+  // The parsed document is carried out rather than re-parsed by the caller: the
+  // schema has already proved it is a JSON object, and parsing the same string
+  // twice is pure waste on a large extraction.
+  return { ok: true, value: parsed.data, json: json as Prisma.InputJsonValue };
 }
 
 /**

@@ -16,6 +16,7 @@ import { recordException } from "../services/exception.service.js";
 import {
   applyExtractionResult,
   applyFallbackClarification,
+  CLOSED_STATUSES,
   loadRequisitionForProcessing,
   type RequisitionChatResult,
 } from "../services/requisition.service.js";
@@ -43,8 +44,26 @@ export async function processRequisitionJob(job: Job): Promise<RequisitionChatRe
 
   const requisition = await loadRequisitionForProcessing({ organizationId, requisitionId });
 
-  // Idempotency: BullMQ may run a job more than once. Once requirements are
-  // extracted the conversation is closed — never call Gemini again.
+  // Idempotency: BullMQ may run a job more than once. Every closed status other
+  // than REQUIREMENTS_EXTRACTED is already past sourcing — a re-delivered job
+  // must not call Gemini for one, and must not re-enqueue discovery behind a
+  // requisition that already has a supplier or a purchase order.
+  if (
+    CLOSED_STATUSES.includes(requisition.status) &&
+    requisition.status !== "REQUIREMENTS_EXTRACTED"
+  ) {
+    return {
+      requisitionId,
+      status: requisition.status,
+      message:
+        requisition.clarificationMessage ?? `Requisition is ${requisition.status}; nothing to do.`,
+      missingFields: [],
+      conflicts: [],
+      requirements: null,
+    };
+  }
+
+  // Requirements are extracted but sourcing may not have been queued yet.
   if (requisition.status === "REQUIREMENTS_EXTRACTED") {
     // Discovery is enqueued after the extraction transaction commits, so a
     // Redis failure in that window leaves extracted requirements with no job

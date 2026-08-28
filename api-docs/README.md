@@ -13,6 +13,7 @@ is `/api/v1` (e.g. `POST /api/v1/requisitions`).
 | 5. Invoice upload & extraction | [`invoices-api.md`](./invoices-api.md) | `POST /invoices`, `GET /invoices/:id`, `GET /invoices` |
 | 6. Matching, payment, exceptions | [`exceptions-api.md`](./exceptions-api.md) | `GET /exceptions`, `GET /exceptions/:id`, `POST /exceptions/:id/resolve` |
 | Cross-cutting: activity log | [`audit-logs-api.md`](./audit-logs-api.md) | `GET /audit-logs` |
+| Cross-cutting: dashboard | [`analytics-api.md`](./analytics-api.md) | `GET /analytics/summary`, `GET /analytics/suppliers`, `GET /analytics/anomalies` |
 
 ## The whole flow, end to end
 
@@ -129,6 +130,11 @@ objects, and `Invoice.status` (`GET /invoices/:id`) instead. Keep watching those
    `EXCEPTION`, with an approve/reject form posting to `/exceptions/:id/resolve`. See
    `exceptions-api.md` for the full contract, including how `releasedForPayment` works and why one
    invoice can carry more than one open exception.
+8. **Analytics dashboard.** One `GET /analytics/summary` call fills a whole screen — funnel,
+   touchless rate, cycle times, exception breakdown, spend, AI latency. Add
+   `GET /analytics/suppliers` for the vendor scorecard and `GET /analytics/anomalies` for the
+   advisory feed. See `analytics-api.md`; note the touchless rate is invoice-side and should be
+   labelled as such, because PO approval is deliberately a human step.
 
 ## Not yet available
 
@@ -139,7 +145,9 @@ Do not build against these — they will 404 or don't exist:
 - A read endpoint for `ThreeWayMatch`/`MatchCheck` — only the *failed* checks behind an open exception
   are exposed, via `exception.metadata.checks`; a passing match's full 12-check breakdown isn't
   fetchable anywhere
-- `GET /suppliers`, `GET /suppliers/:id`
+- `GET /suppliers`, `GET /suppliers/:id` — but `GET /analytics/suppliers` now returns the supplier
+  scorecard (name, rating, OTIF, lead time, reliability, spend), which covers most of what a
+  supplier list is for
 - Socket.IO realtime events — polling is the only mechanism today
 
 When these land, this table and the per-stage docs will be updated — check back before building

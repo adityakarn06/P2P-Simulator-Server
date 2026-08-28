@@ -64,14 +64,33 @@ cloudinary.config({
   secure: true,
 });
 
+/** Longest slug kept from the caller's file name — the invoice id already makes the key unique. */
+const MAX_BASE_NAME_LENGTH = 64;
+
 /**
  * Build the Cloudinary public_id under the `p2p/invoices/{invoiceId}` folder.
  * File extension is stripped because Cloudinary adds it automatically based on
  * the detected resource type.
+ *
+ * The name is slugged, not interpolated. `fileName` is `req.file.originalname`,
+ * which comes straight from the multipart headers and is attacker-controlled: a
+ * name containing `/` or `..` would otherwise escape the per-invoice folder and
+ * break the invoiceId-to-object correspondence that orphan cleanup relies on.
+ * Only the invoice id has to be trustworthy for the key to be safe; the slug is
+ * a human-readable convenience.
  */
 export function buildPublicId(invoiceId: string, fileName: string): string {
-  const baseName = fileName.replace(/\.[^/.]+$/, "");
-  return `p2p/invoices/${invoiceId}/${baseName}`;
+  const baseName = fileName
+    .replace(/\.[^/.]+$/, "")
+    // Everything outside the safe set — path separators and dot-segments
+    // included — collapses to a single underscore.
+    .replace(/[^A-Za-z0-9._-]+/g, "_")
+    .replace(/\.{2,}/g, "_")
+    // A leading dot or dash reads as a hidden file or a flag to some tooling.
+    .replace(/^[.\-_]+/, "")
+    .slice(0, MAX_BASE_NAME_LENGTH);
+
+  return `p2p/invoices/${invoiceId}/${baseName || "document"}`;
 }
 
 /**

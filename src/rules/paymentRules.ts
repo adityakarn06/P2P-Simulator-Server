@@ -22,6 +22,18 @@ export interface PaymentGateInput {
   paymentStatus: PaymentStatus | null;
   /** Exceptions still OPEN or UNDER_REVIEW against this invoice. */
   openExceptionCount: number;
+  /**
+   * True when a *different* invoice against the same purchase order already
+   * holds or has completed a payment.
+   *
+   * Every matched invoice is settled for `purchaseOrder.totalPaise` — the
+   * buyer's own commitment — and `Payment` is unique on `invoiceId`, not on
+   * `purchaseOrderId`. Nothing else in the chain stops two separately-numbered
+   * invoices raised against one purchase order from each passing all twelve
+   * checks: DUPLICATE_INVOICE only catches a repeated invoice *number*. Without
+   * this flag the order gets paid twice, in full.
+   */
+  purchaseOrderAlreadySettled: boolean;
 }
 
 /**
@@ -71,6 +83,16 @@ export function evaluatePayment(input: PaymentGateInput): PaymentDecision {
 
   if (paymentStatus === PaymentStatus.COMPLETED) {
     return { payable: false, reason: "Payment has already completed" };
+  }
+
+  // Checked after the invoice's own payment status so "this invoice is already
+  // paid" is never reported as a sibling's payment. Deliberately last: it is
+  // the only refusal that is about a document other than this one.
+  if (input.purchaseOrderAlreadySettled) {
+    return {
+      payable: false,
+      reason: "Another invoice against this purchase order has already been paid",
+    };
   }
 
   // Reaching here on a MISMATCHED match means a human approved it above.

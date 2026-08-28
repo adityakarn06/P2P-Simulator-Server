@@ -45,6 +45,11 @@ Any line item omitted from `items[]` bills its full ordered quantity. Use the ov
 than what shipped — e.g. matching a partial goods receipt so the re-uploaded invoice `MATCHES`, or
 deliberately over-billing to demo a `QUANTITY_MISMATCH` exception on stage.
 
+An override `quantity` must be **1 or more**. Zero is rejected rather than rendering a ₹0 line: a
+zero-total line compares equal against anything in three-way matching's `UNIT_PRICE` check, so it
+would pass on no money at all. To leave a line off the invoice entirely, that is not yet supported —
+every purchase-order line is billed.
+
 The purchase order must be `APPROVED`, `SHIPPED`, `RECEIVED` or `COMPLETED` — the same rule as
 `POST /invoices`.
 
@@ -61,7 +66,6 @@ returns the invoice already on file rather than rendering a second one):
       "supplierId": "sup_techsource",
       "status": "EXTRACTED",
       "source": "GENERATED",
-      "fileUrl": "https://res.cloudinary.com/.../authenticated/...",
       "fileMimeType": "application/pdf",
       "invoiceNumber": "INV-20260824-ABC123",
       "invoiceDate": "2026-08-26T12:00:00.000Z",
@@ -93,7 +97,7 @@ already-known numbers. Download it with `GET /invoices/:id/pdf` (below).
 | Status | Code | When |
 | --- | --- | --- |
 | 404 | `NOT_FOUND` | Unknown purchase order, or one owned by another organization; unknown `purchaseOrderItemId` in `items[]` |
-| 400 | `VALIDATION_ERROR` | A negative, fractional or out-of-range override `quantity`; the same `purchaseOrderItemId` repeated in `items[]` |
+| 400 | `VALIDATION_ERROR` | An override `quantity` that is zero, negative, fractional or out of range; the same `purchaseOrderItemId` repeated in `items[]` |
 | 409 | `INVALID_STATE` | Purchase order is `DRAFT`, `PENDING_APPROVAL` or `REJECTED` |
 | 503 | `DEPENDENCY_UNAVAILABLE` | Cloudinary unreachable while storing the rendered PDF |
 

@@ -190,3 +190,49 @@ describe("findBestProduct", () => {
     }
   });
 });
+
+/**
+ * Purchase-order lines are described as "<name> (<sku>)", and that is what a
+ * supplier prints and what generateInvoiceForPurchaseOrder renders. Three-way
+ * matching resolves those printed lines back to a product with this same
+ * function, so a line quoting the SKU must never be harder to identify than the
+ * bare name.
+ */
+describe("findBestProduct — a description that quotes the SKU", () => {
+  const catalog = [
+    { id: "p1", sku: "PRPH-KB-001", name: "Wireless Keyboard", category: "Peripherals" },
+    { id: "p2", sku: "PRPH-MS-002", name: "Wireless Mouse", category: "Peripherals" },
+  ];
+
+  it("resolves a purchase-order line description", () => {
+    const result = findBestProduct("Wireless Keyboard (PRPH-KB-001)", null, catalog);
+
+    expect(result).toMatchObject({ status: "MATCHED", product: { id: "p1" } });
+  });
+
+  it("lets the SKU decide when the name alone would be ambiguous", () => {
+    // "Wireless" scores identically against both products; the SKU does not.
+    const result = findBestProduct("Wireless (PRPH-MS-002)", null, catalog);
+
+    expect(result).toMatchObject({ status: "MATCHED", product: { id: "p2" } });
+  });
+
+  it("accepts the SKU in any punctuation form", () => {
+    for (const text of ["PRPH KB 001", "prph-kb-001", "Item prph_kb_001 shipped"]) {
+      expect(findBestProduct(text, null, catalog)).toMatchObject({
+        status: "MATCHED",
+        product: { id: "p1" },
+      });
+    }
+  });
+
+  it("does not let a short SKU match by coincidence inside other wording", () => {
+    const shortSku = [{ id: "p3", sku: "KB1", name: "Keyboard Tray", category: "Furniture" }];
+
+    // "kb1" appears inside the normalized text, but a three-character SKU is
+    // not distinctive enough to be treated as an identifier.
+    expect(findBestProduct("Backup Battery KB1000 Rack", null, shortSku)).toMatchObject({
+      status: "NO_MATCH",
+    });
+  });
+});

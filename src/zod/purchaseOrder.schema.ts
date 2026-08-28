@@ -25,7 +25,10 @@ export type RejectPurchaseOrderInput = z.infer<typeof rejectPurchaseOrderSchema>
  */
 const generatedInvoiceLineOverrideSchema = z.object({
   purchaseOrderItemId: z.string().min(1),
-  quantity: z.number().int().nonnegative(),
+  // Positive, not merely non-negative: a zero-quantity line bills nothing and
+  // renders a ₹0 total. buildGeneratedInvoiceLines enforces the same bound as
+  // the last deterministic gate.
+  quantity: z.number().int().positive(),
 });
 
 /**

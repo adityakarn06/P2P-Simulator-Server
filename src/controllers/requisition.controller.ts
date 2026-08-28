@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { RequisitionStatus } from "../generated/prisma/enums.js";
 import { awaitJobResult } from "../queues/jobResult.js";
 import { enqueueRequisition, requisitionQueue } from "../queues/requisition.queue.js";
 import {
@@ -62,9 +63,12 @@ async function respondWithExtraction(
     return;
   }
 
-  if (result.status === "REQUIREMENTS_EXTRACTED") {
+  // The requisition's real status, never the 202 branch's "PROCESSING" — a
+  // client has to be able to tell "still thinking, poll me" (202) from
+  // "requirements are in, sourcing is running" (200).
+  if (result.status !== RequisitionStatus.NEEDS_CLARIFICATION) {
     sendSuccess(res, {
-      status: "PROCESSING",
+      status: result.status,
       message: result.message,
       requisitionId: result.requisitionId,
       requirements: result.requirements,
@@ -73,7 +77,7 @@ async function respondWithExtraction(
   }
 
   sendSuccess(res, {
-    status: "NEEDS_CLARIFICATION",
+    status: RequisitionStatus.NEEDS_CLARIFICATION,
     message: result.message,
     missingFields: result.missingFields,
     conflicts: result.conflicts,

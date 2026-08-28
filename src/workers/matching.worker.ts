@@ -2,6 +2,7 @@ import type { Job } from "bullmq";
 import { InvoiceSource, InvoiceStatus, MatchStatus } from "../generated/prisma/enums.js";
 import { enqueuePayment } from "../queues/payment.queue.js";
 import { threeWayMatch } from "../rules/threeWayMatch.js";
+import { evaluateInvoice } from "../services/anomaly.service.js";
 import {
   applyMatchResult,
   claimInvoiceForMatching,
@@ -12,6 +13,7 @@ import {
 } from "../services/matching.service.js";
 import { matchingJobSchema } from "../types/types.js";
 import { AppError, type ErrorCode } from "../utils/AppError.js";
+import { parseJobData } from "./parseJobData.js";
 
 export interface MatchingResult {
   invoiceId: string;
@@ -32,17 +34,11 @@ export interface MatchingResult {
  * so BullMQ never retries a decision that cannot change.
  */
 export async function processMatchingJob(job: Job): Promise<MatchingResult> {
-  let invoiceId: string;
-  let organizationId: string;
-  try {
-    ({ invoiceId, organizationId } = matchingJobSchema.parse(job.data));
-  } catch (parseError) {
-    const reason =
-      parseError instanceof Error ? parseError.message : "Invalid matching job payload";
-    console.error(`Matching job ${job.id}: invalid payload — ${reason}`, job.data);
-    // Return a skipped result; BullMQ will not retry because we are not throwing.
-    return { invoiceId: String(job.id ?? "unknown"), status: null, skippedReason: reason };
-  }
+  // Same as every other worker: a malformed payload is terminal, and it belongs
+  // in BullMQ's failed set. Returning a "skipped" result here instead would
+  // report the job as completed and put the *job id* in the invoiceId field,
+  // naming an entity that does not exist.
+  const { invoiceId, organizationId } = parseJobData(matchingJobSchema, job.data, "matching");
 
   try {
     const context = await loadMatchingContext({ organizationId, invoiceId });
@@ -105,6 +101,12 @@ export async function processMatchingJob(job: Job): Promise<MatchingResult> {
       goodsReceiptId: context.purchaseOrder.shipment?.goodsReceipt?.id ?? null,
       result,
     });
+
+    // Advisory only, and deliberately after the verdict is persisted: an
+    // anomaly signal can never change a match or block a payment. Run before
+    // the payment enqueue purely so a buyer looking at a just-paid invoice
+    // already sees whatever the history had to say about it.
+    await evaluateInvoice({ organizationId, invoiceId });
 
     // Enqueued after the transaction commits, never inside it — and never at
     // all for a mismatch, whose payment row is already BLOCKED.

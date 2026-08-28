@@ -49,6 +49,71 @@ export async function loadPaymentContext(params: {
   return invoice;
 }
 
+/**
+ * True when a *different* invoice against the same purchase order already holds
+ * or has completed a payment.
+ *
+ * PROCESSING counts as settled: a worker is inside the provider call for it
+ * right now, and letting a sibling through would be exactly the double payment
+ * this guard exists to stop.
+ */
+export async function hasSettledSiblingInvoice(params: {
+  organizationId: string;
+  invoiceId: string;
+  purchaseOrderId: string;
+}): Promise<boolean> {
+  const count = await prisma.payment.count({
+    where: {
+      organizationId: params.organizationId,
+      purchaseOrderId: params.purchaseOrderId,
+      invoiceId: { not: params.invoiceId },
+      status: { in: [PaymentStatus.PROCESSING, PaymentStatus.COMPLETED] },
+    },
+  });
+
+  return count > 0;
+}
+
+/**
+ * Records that this invoice was refused because its purchase order is already
+ * settled by another document. Without a row here the refusal is invisible —
+ * the job returns normally and nothing tells a human that a second invoice
+ * arrived for an order that has already been paid.
+ */
+export async function recordDuplicatePurchaseOrderPayment(params: {
+  organizationId: string;
+  invoiceId: string;
+  purchaseOrderId: string;
+  poNumber: string;
+  reason: string;
+}): Promise<void> {
+  const { organizationId, invoiceId, purchaseOrderId, poNumber, reason } = params;
+
+  await prisma.$transaction(async (tx) => {
+    await recordException(tx, {
+      organizationId,
+      type: ExceptionType.DUPLICATE_INVOICE,
+      severity: Severity.CRITICAL,
+      entityType: INVOICE_ENTITY,
+      entityId: invoiceId,
+      title: "Purchase order already paid on another invoice",
+      description: reason,
+      metadata: { purchaseOrderId, poNumber },
+    });
+
+    // BLOCKED, not FAILED: this is a business refusal awaiting a human, not a
+    // provider error. Only a row that has not settled may be moved.
+    await tx.payment.updateMany({
+      where: {
+        invoiceId,
+        organizationId,
+        status: { in: [PaymentStatus.PENDING, PaymentStatus.FAILED] },
+      },
+      data: { status: PaymentStatus.BLOCKED, blockedReason: reason },
+    });
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Claim
 // ---------------------------------------------------------------------------
@@ -157,6 +222,12 @@ export async function claimPaymentForProcessing(params: {
     // off — its backoff is far shorter than the lease, so it must not be made to
     // wait one out), or the claim has gone stale and its owner is presumed dead.
     // Anything else belongs to a worker that may be inside charge() right now.
+    //
+    // There is deliberately no third "unowned row" case. Every PROCESSING row is
+    // written with both claimedBy and processedAt set, in one transaction, so a
+    // row with neither cannot be produced by this code — and matching an
+    // ownerless row unconditionally would hand out a claim regardless of lease.
+    // A row that somehow lacks a processedAt stays put for a human instead.
     const resumed = await tx.payment.updateMany({
       where: {
         invoiceId,
@@ -165,8 +236,6 @@ export async function claimPaymentForProcessing(params: {
         OR: [
           { claimedBy: claimToken },
           { processedAt: { lt: new Date(processedAt.getTime() - PAYMENT_CLAIM_LEASE_MS) } },
-          // A row written before this column existed has no owner to compare.
-          { claimedBy: null, processedAt: null },
         ],
       },
       data: claimData,
@@ -234,10 +303,25 @@ export async function applyPaymentCompletion(params: {
     });
 
     if (invoiceUpdate.count === 0) {
-      console.warn(
-        `Invoice ${invoiceId}: payment completed (ref: ${providerReference}) but invoice was not` +
-          ` in APPROVED state — no status transition applied. Manual reconciliation may be needed.`,
-      );
+      const reason =
+        `Payment completed (provider reference ${providerReference}) but the invoice was not in` +
+        " APPROVED state, so it was not moved to PAID. Money has moved; reconcile manually.";
+
+      console.warn(`Invoice ${invoiceId}: ${reason}`);
+
+      // A log line is not a signal anyone will see. Money left the building
+      // against an invoice the workflow does not consider payable — that is
+      // exactly what the exception queue is for.
+      await recordException(tx, {
+        organizationId,
+        type: ExceptionType.SYSTEM_FAILURE,
+        severity: Severity.CRITICAL,
+        entityType: INVOICE_ENTITY,
+        entityId: invoiceId,
+        title: "Payment settled against a non-approved invoice",
+        description: reason,
+        metadata: { providerReference, provider: PAYMENT_PROVIDER_NAME },
+      });
     }
 
     await recordAudit(tx, {

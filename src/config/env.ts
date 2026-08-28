@@ -21,11 +21,6 @@ export const envSchema = z.object({
   CLOUDINARY_API_KEY: z.string().min(1),
   CLOUDINARY_API_SECRET: z.string().min(1),
 
-  // Required, not optional. An undefined origin makes the cors package fall
-  // back to "*", and "*" paired with credentials: true (src/app.ts) is the
-  // classic permissive-CORS misconfiguration.
-  CORS_ORIGIN: z.string().min(1).default("http://localhost:3000"),
-
   // Number of proxy hops in front of this process, for express-rate-limit's
   // client-IP resolution. Defaults to 0 (trust nobody): when the process is
   // reachable directly, trusting a hop that is not there lets any client forge

@@ -50,14 +50,23 @@ const EXTRACTED_STATUSES: InvoiceStatus[] = [
 // Read shapes
 // ---------------------------------------------------------------------------
 
-/** The invoice shape every read path returns. `fileUrl` is a signed, expiring URL. */
+/**
+ * The invoice shape every read path returns.
+ *
+ * `fileUrl` is deliberately absent. The column is still written — it is the
+ * provenance record of where the document was stored — but the value is a
+ * Cloudinary delivery URL signed with no `expires_at`, so it never expires, and
+ * Cloudinary blocks PDF *delivery* by default (see CloudinaryStorage.download),
+ * which makes it a permanent link that does not even work for most invoices.
+ * Clients read the document through GET /api/v1/invoices/:id/pdf, which streams
+ * the bytes back through a freshly minted, short-lived download link.
+ */
 export const invoiceViewSelect = {
   id: true,
   purchaseOrderId: true,
   supplierId: true,
   status: true,
   source: true,
-  fileUrl: true,
   fileMimeType: true,
   fileSizeBytes: true,
   invoiceNumber: true,
@@ -530,6 +539,28 @@ export async function claimInvoiceForExtraction(params: {
   });
 
   return count > 0;
+}
+
+/**
+ * Counts a retry that resumed an invoice already left in PROCESSING.
+ *
+ * The claim above only fires on the UPLOADED -> PROCESSING edge, so without
+ * this every attempt after the first went uncounted and `extractionAttempts`
+ * read 1 no matter how many times Gemini was actually asked. Guarded on
+ * PROCESSING so it can only ever count a real resumed attempt.
+ */
+export async function countExtractionRetry(params: {
+  organizationId: string;
+  invoiceId: string;
+}): Promise<void> {
+  await prisma.invoice.updateMany({
+    where: {
+      id: params.invoiceId,
+      organizationId: params.organizationId,
+      status: InvoiceStatus.PROCESSING,
+    },
+    data: { extractionAttempts: { increment: 1 }, failureReason: null },
+  });
 }
 
 /**

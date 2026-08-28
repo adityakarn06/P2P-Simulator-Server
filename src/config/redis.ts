@@ -17,6 +17,18 @@ const WORKER_REDIS_OPTIONS: RedisOptions = {
  */
 export const redis = new Redis(process.env.REDIS_URL, PRODUCER_REDIS_OPTIONS);
 
-export function createRedisConnection(): Redis {
-  return new Redis(process.env.REDIS_URL, WORKER_REDIS_OPTIONS);
+/**
+ * A blocking-safe connection (maxRetriesPerRequest: null) for Workers and
+ * QueueEvents.
+ *
+ * Redis Cloud caps concurrent clients, so callers should share one of these
+ * across every BullMQ consumer in the process: BullMQ treats an instance it is
+ * handed as `shared` and duplicates it once per consumer for the blocking
+ * loop, so N workers cost 1 + N sockets rather than 2N.
+ *
+ * Pass `{ lazyConnect: true }` when the instance exists only to be duplicated
+ * (QueueEvents duplicates unconditionally) — the original then never dials.
+ */
+export function createRedisConnection(overrides?: RedisOptions): Redis {
+  return new Redis(process.env.REDIS_URL, { ...WORKER_REDIS_OPTIONS, ...overrides });
 }

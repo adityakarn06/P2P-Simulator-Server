@@ -2,7 +2,7 @@ import { prisma } from "../config/prisma.js";
 import type { Prisma } from "../generated/prisma/client.js";
 import {
   ExceptionStatus,
-  type ExceptionType,
+  ExceptionType,
   InvoiceStatus,
   PaymentStatus,
   type Severity,
@@ -59,8 +59,29 @@ export async function recordException(
         entityId: input.entityId,
       },
     },
-    select: { id: true },
+    select: { id: true, status: true },
   });
+
+  // A closed row plus a fresh occurrence means the problem came back after a
+  // human signed it off. Leaving it RESOLVED strands the entity forever: the
+  // invoice is moved to EXCEPTION, the payment gate refuses it for having an
+  // exception, and resolveExceptionById refuses to re-decide a closed row — so
+  // nothing short of a manual database edit can release it. Reopening restores
+  // the only path out. A row that is still OPEN or UNDER_REVIEW is left alone,
+  // so a plain re-drive never disturbs a decision in progress.
+  const reopened =
+    existing !== null &&
+    (existing.status === ExceptionStatus.RESOLVED || existing.status === ExceptionStatus.REJECTED);
+
+  const reopenFields = reopened
+    ? {
+        status: ExceptionStatus.OPEN,
+        resolution: null,
+        resolutionReason: null,
+        resolvedAt: null,
+        resolvedBy: null,
+      }
+    : {};
 
   const exception = await db.exception.upsert({
     where: {
@@ -77,9 +98,27 @@ export async function recordException(
       entityId: input.entityId,
       ...payload,
     },
-    update: payload,
+    update: { ...payload, ...reopenFields },
     select: { id: true },
   });
+
+  if (reopened) {
+    await recordAudit(db, {
+      organizationId: input.organizationId,
+      actorType: "SYSTEM",
+      action: "EXCEPTION_CREATED",
+      entityType: EXCEPTION_ENTITY,
+      entityId: exception.id,
+      metadata: {
+        reopened: true,
+        previousStatus: existing.status,
+        type: input.type,
+        severity: input.severity,
+        entityType: input.entityType,
+        entityId: input.entityId,
+      },
+    });
+  }
 
   if (!existing) {
     await recordAudit(db, {
@@ -293,9 +332,24 @@ export async function resolveExceptionById(
       });
     }
 
+    // PO_APPROVAL_REQUIRED is not this endpoint's to close. Resolving it here
+    // would mark the exception RESOLVED while leaving the purchase order in
+    // PENDING_APPROVAL with nothing open against it — invisible to the operator
+    // and unreachable by the approval flow, which closes this exception itself.
+    if (exception.type === ExceptionType.PO_APPROVAL_REQUIRED) {
+      throw AppError.invalidState(
+        "A purchase-order approval is decided on the purchase order, not here — use POST /api/v1/purchase-orders/:id/approve or /reject",
+        { exceptionId, type: exception.type, entityId: exception.entityId },
+      );
+    }
+
     const conditionalUpdate = await tx.exception.updateMany({
       where: {
         id: exceptionId,
+        // Scoped even though the pre-read above already proved ownership: every
+        // other write in this file carries the tenant, and relying on a
+        // preceding read is one refactor away from a cross-tenant write.
+        organizationId,
         status: { in: [ExceptionStatus.OPEN, ExceptionStatus.UNDER_REVIEW] },
       },
       data: {

@@ -202,6 +202,20 @@ a single conditional update on `status IN (OPEN, UNDER_REVIEW)`, so a duplicate 
 second `PAYMENT_APPROVED`/`EXCEPTION_RESOLVED` audit row, re-enqueue payment, or move the invoice
 twice — it just gets the 409 instead.
 
+### An exception can come back
+
+"Terminal" applies to *deciding* it, not to the row for all time. There is at most one exception per
+`(organizationId, type, entityId)`, so if the same failure genuinely happens again after a human
+resolved it — the invoice is re-matched and mismatches the same way — that row is **reopened**: back
+to `OPEN`, with `resolution`, `resolutionReason`, `resolvedAt` and `resolvedBy` cleared, and a fresh
+audit row recording the reopen and the status it came from.
+
+Without this the entity would be stranded: it sits in `EXCEPTION`, the payment gate refuses it for
+having an exception, and resolve refuses to re-decide a closed row. A re-drive that changes nothing
+does *not* reopen anything — a row still `OPEN` or `UNDER_REVIEW` is left exactly as it is, so a
+decision in progress is never disturbed. For the UI this means: don't cache an exception as
+permanently decided; `RESOLVED` can legitimately become `OPEN` again on a later poll.
+
 ## Exception types
 
 The `type` field on every exception. Not all of these originate from this stage — some are opened
@@ -214,12 +228,12 @@ earlier in the pipeline and are only reachable through this API now that it exis
 | `QUANTITY_MISMATCH` | Matching — `ORDERED_QUANTITY`, `RECEIVED_QUANTITY`, or `INVOICED_QUANTITY` check failed | `Invoice` |
 | `PRICE_MISMATCH` | Matching — `UNIT_PRICE` or `SUBTOTAL` check failed | `Invoice` |
 | `SUPPLIER_MISMATCH` | Matching — invoice's stated supplier doesn't match the PO's | `Invoice` |
-| `DUPLICATE_INVOICE` | Matching — invoice number already recorded for this org | `Invoice` |
+| `DUPLICATE_INVOICE` | Matching — invoice number already recorded for this org. Also raised by the **payment gate** when a *different* invoice against the same purchase order has already been paid: that second document passes every three-way check (its number is genuinely new) but is refused settlement, so the order can never be paid twice. | `Invoice` |
 | `TAX_MISMATCH` | Matching — `TAX` check failed | `Invoice` |
 | `TOTAL_MISMATCH` | Matching — `TOTAL` or `CURRENCY` check failed | `Invoice` |
 | `PAYMENT_FAILURE` | Payment worker, after 3 failed provider attempts | `Invoice` |
 | `SYSTEM_FAILURE` | Either worker, after 3 failed *technical* (non-business) attempts, or an unmapped check | `Invoice` (or `Requisition`) |
-| `PO_APPROVAL_REQUIRED` | PO worker, when a generated PO's total is at or above the auto-approve threshold | `PurchaseOrder` |
+| `PO_APPROVAL_REQUIRED` | PO worker, when a generated PO's total is at or above the auto-approve threshold. **Not resolvable here** — decide it on the purchase order with `POST /purchase-orders/:id/approve` or `/reject`, which closes this exception itself. Posting it to `/exceptions/:id/resolve` returns `409 INVALID_STATE`, because resolving it here would close the exception while leaving the order stuck in `PENDING_APPROVAL` with nothing open against it. | `PurchaseOrder` |
 | `REQUIREMENT_INCOMPLETE` | **Reserved — deliberately not raised.** A requisition missing required fields does not open an exception; it stays in a conversational `NEEDS_CLARIFICATION` loop instead (`clarificationMessage` + `missingFields` on the requisition, driven by `POST /api/v1/requisitions/:id/messages` — see `api-docs/requisitions-api.md`). That loop is the better UX for something an ordinary back-and-forth with the requester can resolve; an exceptions-inbox entry is for something only an approver, not the requester, can decide. | — |
 
 An invoice can accumulate several exceptions at once (one per distinct failing check group — see
@@ -236,7 +250,7 @@ detail view that wants to show the specific numbers rather than just the prose `
 | --- | --- | --- |
 | 400 | `VALIDATION_ERROR` | `decision` missing/invalid, or `reason` under 10 or over 1000 characters |
 | 404 | `NOT_FOUND` | Unknown exception, or one owned by another organization |
-| 409 | `INVALID_STATE` | Exception is already `RESOLVED` or `REJECTED` |
+| 409 | `INVALID_STATE` | Exception is already `RESOLVED` or `REJECTED`, or its type is `PO_APPROVAL_REQUIRED` (decide that on the purchase order — see the type table above). `details` carries `{ exceptionId, status }` or `{ exceptionId, type, entityId }` respectively. |
 
 ## Not yet available
 

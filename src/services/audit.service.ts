@@ -17,6 +17,7 @@ export const AUDIT_ENTITY_TYPES = [
   "GoodsReceipt",
   "Invoice",
   "Exception",
+  "Supplier",
 ] as const;
 export type AuditEntityType = (typeof AUDIT_ENTITY_TYPES)[number];
 
@@ -29,6 +30,7 @@ export const [
   GOODS_RECEIPT_ENTITY,
   INVOICE_ENTITY,
   EXCEPTION_ENTITY,
+  SUPPLIER_ENTITY,
 ] = AUDIT_ENTITY_TYPES;
 
 export interface AuditInput {

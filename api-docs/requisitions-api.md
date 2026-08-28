@@ -129,7 +129,7 @@ interface RequestBody {
 
 ```ts
 interface RequisitionChatResult {
-  status: "NEEDS_CLARIFICATION" | "PROCESSING" | "REQUIREMENTS_EXTRACTED";
+  status: RequisitionStatus;                    // the requisition's real status — see below
   requisitionId: string;
   message: string;                              // assistant's natural-language reply, always render
   missingFields?: string[];                     // present when status = NEEDS_CLARIFICATION
@@ -138,10 +138,19 @@ interface RequisitionChatResult {
 }
 ```
 
-Note: when extraction completes, the response's `status` field is `"PROCESSING"` (not
-`"REQUIREMENTS_EXTRACTED"`) — it reflects that the requisition has moved on to supplier
-discovery, with `requirements` populated as the completion signal. Use
-`requirements != null` to detect a completed extraction, not the `status` string.
+`status` is the requisition's actual status, so a `200` and a `202` can be told apart by it:
+
+| `status` | What it means |
+| --- | --- |
+| `NEEDS_CLARIFICATION` | The assistant asked a question. Render `message`, show `missingFields`, keep the composer open. |
+| `REQUIREMENTS_EXTRACTED` | Requirements are in and supplier discovery has been queued. `requirements` is populated. |
+| `PROCESSING` | **`202` only** — the worker had not answered within ~20s. Poll `GET /:id`. |
+| `SUPPLIER_SELECTED` / `PO_CREATED` / `FAILED` | The requisition had already moved past the conversation when this turn was delivered; nothing was changed. Treat as read-only and render the current state. |
+
+Earlier revisions of this API returned `"PROCESSING"` on the `200` completion branch, so clients
+were told to detect completion with `requirements != null` rather than the status string. That is
+fixed — `status` is now authoritative, and `"PROCESSING"` appears only on a `202`. The
+`requirements != null` check still works and remains a safe thing to keep.
 
 Example — needs clarification:
 
@@ -159,7 +168,7 @@ Example — complete in one turn:
 
 ```json
 { "success": true, "data": {
-  "status": "PROCESSING",
+  "status": "REQUIREMENTS_EXTRACTED",
   "requisitionId": "clx1a2b3c",
   "message": "Got it. I have all the requirements and started the procurement process.",
   "requirements": {

@@ -12,6 +12,7 @@ const PAYABLE = {
   matchStatus: MatchStatus.MATCHED,
   paymentStatus: null,
   openExceptionCount: 0,
+  purchaseOrderAlreadySettled: false,
 } as const;
 
 describe("evaluatePayment", () => {
@@ -35,6 +36,7 @@ describe("evaluatePayment", () => {
       matchStatus: MatchStatus.MISMATCHED,
       paymentStatus: PaymentStatus.BLOCKED,
       openExceptionCount: 1,
+      purchaseOrderAlreadySettled: false,
     });
 
     expect(decision.payable).toBe(false);
@@ -114,6 +116,7 @@ describe("evaluatePayment", () => {
       matchStatus: MatchStatus.MATCHED,
       paymentStatus: PaymentStatus.BLOCKED,
       openExceptionCount: 1,
+      purchaseOrderAlreadySettled: false,
     });
 
     expect(decision).toEqual({ payable: false, reason: "Invoice is EXCEPTION, not APPROVED" });

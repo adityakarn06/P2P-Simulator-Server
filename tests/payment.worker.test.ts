@@ -6,7 +6,7 @@ process.env.DATABASE_URL ??= "postgresql://user:pass@localhost:5432/db";
 
 const db = {
   invoice: { findFirst: vi.fn(), updateMany: vi.fn() },
-  payment: { create: vi.fn(), updateMany: vi.fn() },
+  payment: { create: vi.fn(), updateMany: vi.fn(), count: vi.fn() },
   exception: { upsert: vi.fn(), count: vi.fn(), findUnique: vi.fn() },
   auditLog: { create: vi.fn() },
 };
@@ -103,6 +103,8 @@ beforeEach(() => {
   db.invoice.updateMany.mockResolvedValue({ count: 1 });
   db.payment.create.mockResolvedValue({ id: "pay-1" });
   db.payment.updateMany.mockResolvedValue({ count: 1 });
+  // No sibling invoice has taken this purchase order's money, unless a test says so.
+  db.payment.count.mockResolvedValue(0);
   db.exception.upsert.mockResolvedValue({ id: "exc-1" });
   db.exception.findUnique.mockResolvedValue(null);
   db.exception.count.mockResolvedValue(0);
@@ -323,6 +325,28 @@ describe("processPaymentJob — refusals", () => {
     expect(db.invoice.updateMany).not.toHaveBeenCalled();
     expect(auditActions()).not.toContain("PAYMENT_COMPLETED");
   });
+
+  it("raises an exception when money moved but the invoice was not APPROVED", async () => {
+    db.invoice.findFirst.mockResolvedValue(buildContext());
+    // The payment settles, but the guarded invoice transition finds nothing to
+    // move — the invoice left APPROVED between the gate and the settle.
+    db.invoice.updateMany.mockResolvedValue({ count: 0 });
+
+    await processPaymentJob(buildJob());
+
+    // A console.warn is not a signal anybody sees; this has to reach the
+    // exception queue, because money has actually left.
+    expect(firstArg(db.exception.upsert)).toMatchObject({
+      where: {
+        organizationId_type_entityId: {
+          organizationId: ORG,
+          type: "SYSTEM_FAILURE",
+          entityId: INVOICE,
+        },
+      },
+    });
+    expect(auditActions()).toContain("PAYMENT_COMPLETED");
+  });
 });
 
 describe("processPaymentJob — provider failures", () => {
@@ -368,6 +392,59 @@ describe("processPaymentJob — provider failures", () => {
 
     expect(result.status).toBe("FAILED");
     expect(db.exception.upsert).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("processPaymentJob — one purchase order, one payment", () => {
+  beforeEach(() => {
+    db.invoice.findFirst.mockResolvedValue(buildContext());
+    // A different invoice against the same purchase order already has the money.
+    db.payment.count.mockResolvedValue(1);
+  });
+
+  it("refuses a second invoice once its purchase order has already been paid", async () => {
+    const result = await processPaymentJob(buildJob());
+
+    expect(charge).not.toHaveBeenCalled();
+    expect(db.payment.create).not.toHaveBeenCalled();
+    expect(result.skippedReason).toBe(
+      "Another invoice against this purchase order has already been paid",
+    );
+  });
+
+  it("counts only sibling invoices whose payment holds or has taken the money", async () => {
+    await processPaymentJob(buildJob());
+
+    expect(firstArg(db.payment.count)).toMatchObject({
+      where: {
+        organizationId: ORG,
+        purchaseOrderId: "po-1",
+        invoiceId: { not: INVOICE },
+        status: { in: ["PROCESSING", "COMPLETED"] },
+      },
+    });
+  });
+
+  it("raises a DUPLICATE_INVOICE exception so the second document is visible", async () => {
+    await processPaymentJob(buildJob());
+
+    expect(firstArg(db.exception.upsert)).toMatchObject({
+      where: {
+        organizationId_type_entityId: {
+          organizationId: ORG,
+          type: "DUPLICATE_INVOICE",
+          entityId: INVOICE,
+        },
+      },
+    });
+  });
+
+  it("does not raise the exception for an invoice that was never approved", async () => {
+    db.invoice.findFirst.mockResolvedValue(buildContext({ status: "PAID" }));
+
+    await processPaymentJob(buildJob());
+
+    expect(db.exception.upsert).not.toHaveBeenCalled();
   });
 });
 

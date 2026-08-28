@@ -10,6 +10,7 @@ const db = {
   shipment: { findFirst: vi.fn(), findUniqueOrThrow: vi.fn(), updateMany: vi.fn() },
   goodsReceipt: { create: vi.fn() },
   purchaseOrder: { updateMany: vi.fn(), findUniqueOrThrow: vi.fn() },
+  supplier: { update: vi.fn() },
   auditLog: { create: vi.fn() },
 };
 
@@ -35,6 +36,7 @@ const ORG = "dev-org";
 const PO = "po-1";
 const SHIPMENT = "ship-1";
 const PO_ITEM = "poi-1";
+const SUPPLIER = "sup-techsource";
 
 function purchaseOrder(overrides: Record<string, unknown> = {}) {
   return {
@@ -77,6 +79,9 @@ function shipmentWithContext(overrides: Record<string, unknown> = {}) {
     purchaseOrder: {
       id: PO,
       status: "APPROVED",
+      supplierId: SUPPLIER,
+      approvedAt: new Date("2026-08-24T00:00:00.000Z"),
+      createdAt: new Date("2026-08-24T00:00:00.000Z"),
       items: [{ id: PO_ITEM, productId: "prod-kb", quantity: 100 }],
     },
     ...overrides,
@@ -151,7 +156,38 @@ beforeEach(() => {
   db.goodsReceipt.create.mockResolvedValue(goodsReceipt());
   db.purchaseOrder.updateMany.mockResolvedValue({ count: 1 });
   db.purchaseOrder.findUniqueOrThrow.mockResolvedValue(purchaseOrder());
+  // The first supplier.update is the atomic counter increment, and it returns
+  // the row those increments landed on.
+  db.supplier.update.mockResolvedValue(supplierAfterIncrement());
 });
+
+/**
+ * What the counter increment returns: a supplier with one delivery on the
+ * books, no history before it. `updateSupplierPerformance` derives the score
+ * and the running lead time from exactly this shape.
+ */
+function supplierAfterIncrement(overrides: Record<string, unknown> = {}) {
+  return {
+    id: SUPPLIER,
+    reliabilityScore: 0.9,
+    baselineReliability: 0.9,
+    totalDeliveries: 1,
+    onTimeDeliveries: 1,
+    inFullDeliveries: 1,
+    orderedUnits: 100,
+    acceptedUnits: 100,
+    damagedUnits: 0,
+    avgLeadTimeDays: null,
+    ...overrides,
+  };
+}
+
+/** The `data` of each supplier.update call, in order. */
+function supplierUpdates(): Record<string, unknown>[] {
+  return db.supplier.update.mock.calls.map(
+    (call) => (call[0] as { data: Record<string, unknown> }).data,
+  );
+}
 
 describe("POST /api/v1/receipts/simulate", () => {
   it("records a full receipt: shipment DELIVERED, purchase order RECEIVED", async () => {
@@ -190,7 +226,7 @@ describe("POST /api/v1/receipts/simulate", () => {
         data: { status: "RECEIVED" },
       }),
     );
-    expect(auditActions()).toEqual(["GOODS_RECEIVED"]);
+    expect(auditActions()).toEqual(["GOODS_RECEIVED", "SUPPLIER_PERFORMANCE_UPDATED"]);
   });
 
   it("records 98 received / 2 damaged as PARTIAL with 96 accepted", async () => {
@@ -260,6 +296,89 @@ describe("POST /api/v1/receipts/simulate", () => {
     expect(db.goodsReceipt.create).not.toHaveBeenCalled();
     expect(db.shipment.updateMany).not.toHaveBeenCalled();
     expect(db.auditLog.create).not.toHaveBeenCalled();
+    // The whole risk of the OTIF loop: a re-delivered request must not count
+    // the same delivery a second time and drag the supplier's score with it.
+    expect(db.supplier.update).not.toHaveBeenCalled();
+  });
+
+  it("counts the delivery against the supplier exactly once, on time and in full", async () => {
+    db.goodsReceipt.create.mockResolvedValue(
+      goodsReceipt({
+        status: "COMPLETED",
+        items: [
+          {
+            id: "ri-1",
+            purchaseOrderItemId: PO_ITEM,
+            productId: "prod-kb",
+            orderedQuantity: 100,
+            receivedQuantity: 100,
+            damagedQuantity: 0,
+            acceptedQuantity: 100,
+          },
+        ],
+      }),
+    );
+
+    const res = await simulate({ shipmentId: SHIPMENT, receivedQuantity: 100, damagedQuantity: 0 });
+
+    expect(res.status).toBe(201);
+
+    const [increment, derived] = supplierUpdates() as [
+      Record<string, Record<string, number>>,
+      Record<string, unknown>,
+    ];
+
+    // Counters move atomically, so a concurrent receipt for another shipment
+    // of the same supplier cannot clobber them.
+    expect(increment).toEqual({
+      totalDeliveries: { increment: 1 },
+      onTimeDeliveries: { increment: 1 },
+      inFullDeliveries: { increment: 1 },
+      orderedUnits: { increment: 100 },
+      acceptedUnits: { increment: 100 },
+      damagedUnits: { increment: 0 },
+    });
+
+    // A flawless delivery on a supplier already seeded at 0.9 cannot move the
+    // score down, and the shrinkage prior keeps it from jumping to 1.0.
+    expect(derived.reliabilityScore).toBeGreaterThanOrEqual(0.9);
+    expect(derived.reliabilityScore).toBeLessThan(1);
+    expect(derived.baselineReliability).toBe(0.9);
+  });
+
+  it("records a short, damaged delivery as neither on time nor in full", async () => {
+    db.shipment.findFirst.mockResolvedValue(
+      shipmentWithContext({
+        // Promised the 25th, arrived on the 26th.
+        expectedDeliveryDate: new Date("2026-08-25T00:00:00.000Z"),
+      }),
+    );
+    db.supplier.update.mockResolvedValue(
+      supplierAfterIncrement({
+        onTimeDeliveries: 0,
+        inFullDeliveries: 0,
+        acceptedUnits: 96,
+        damagedUnits: 2,
+      }),
+    );
+
+    const res = await simulate({ shipmentId: SHIPMENT, receivedQuantity: 98, damagedQuantity: 2 });
+
+    expect(res.status).toBe(201);
+
+    const [increment, derived] = supplierUpdates() as [
+      Record<string, Record<string, number>>,
+      Record<string, unknown>,
+    ];
+
+    expect(increment.onTimeDeliveries).toEqual({ increment: 0 });
+    expect(increment.inFullDeliveries).toEqual({ increment: 0 });
+    expect(increment.acceptedUnits).toEqual({ increment: 96 });
+    expect(increment.damagedUnits).toEqual({ increment: 2 });
+
+    // The point of the whole loop: a bad delivery costs the supplier ranking
+    // position on the next requisition.
+    expect(derived.reliabilityScore).toBeLessThan(0.9);
   });
 
   it("refuses a replay reporting different quantities", async () => {

@@ -23,6 +23,19 @@ it("hello world", () => {
 
 # Procurement AI Backend
 
+> **Where this document and the code differ, the code is right.** Several sections below describe an
+> intended design that was deliberately not built:
+>
+> - **Storage is Cloudinary, not S3.** `src/storage/storage.interface.ts` is the seam; there is no
+>   `S3StorageProvider` and no AWS SDK dependency. Read "S3" below as "the storage provider".
+> - **There is no authentication and no Clerk.** `src/middleware/auth.ts` attaches a fixed dev
+>   tenant from an unverified `x-organization-id` header. Tenant scoping is enforced per query.
+> - **There is no Socket.IO.** Clients poll; `api-docs/` documents the polling contract.
+> - **There is no structured logger.** `console.log` / `console.error` only.
+>
+> Everything else — the deterministic/AI boundary, the queue topology, integer-paise money, the
+> state machines, idempotency, and audit logging — matches the implementation.
+
 ## Mission
 
 Standalone backend for an AI-powered Procure-to-Pay (P2P) hackathon MVP.
@@ -300,6 +313,7 @@ Payment
 Exception
 AuditLog
 AIProcessingLog
+AnomalySignal
 ```
 
 Every organization-owned model should contain `organizationId`.
@@ -976,6 +990,9 @@ Initial routes:
 /api/v1/exceptions/:id
 /api/v1/exceptions/:id/resolve
 /api/v1/audit-logs
+/api/v1/analytics/summary
+/api/v1/analytics/suppliers
+/api/v1/analytics/anomalies
 /health
 /ready
 ```
@@ -1197,7 +1214,13 @@ Do NOT add unless explicitly requested:
 - SAP integration
 - Oracle integration
 - complex event sourcing
-- advanced anomaly detection
+- machine-learned or model-based anomaly detection
+
+  Note: *deterministic statistical* anomaly signals are in scope and implemented
+  (`src/rules/anomalyDetection.ts`) — `problemStatement.md` names predictive anomaly detection as a
+  required capability. They are mean/σ comparisons against the organization's own history, they are
+  advisory only, and they can never block a payment or change a match verdict. What stays out of
+  scope is anything model-based.
 - multi-region infrastructure
 - complicated RBAC
 - workflow designer

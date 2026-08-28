@@ -79,7 +79,6 @@ happened yet**:
       "supplierId": "sup_techsource",
       "status": "UPLOADED",
       "source": "UPLOADED",
-      "fileUrl": "https://res.cloudinary.com/.../authenticated/...",
       "fileMimeType": "application/pdf",
       "fileSizeBytes": 48213,
       "invoiceNumber": null,
@@ -105,8 +104,9 @@ happened yet**:
 Every extracted field is `null` and `items` is empty at this point. Poll `GET /invoices/:id` until
 `status` leaves `UPLOADED`/`PROCESSING`.
 
-`fileUrl` is a **signed, expiring** Cloudinary URL — usable to show a preview, but don't persist it
-client-side or treat it as a permanent link.
+The response carries no document URL. To show or download the document, call
+`GET /api/v1/invoices/:id/pdf`, which streams the stored bytes back through a freshly minted,
+short-lived link — it works for a `GENERATED` PDF and an `UPLOADED` PDF/PNG/JPEG alike.
 
 ## `Invoice.status`
 

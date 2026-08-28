@@ -172,7 +172,7 @@ async function sourceRequisition(
             .join(", ")}) — the request is not specific enough to source`
         : `No catalog product matches "${requirement.productName}"`;
 
-    await applySourcingFailure({
+    const failed = await applySourcingFailure({
       organizationId,
       requisitionId,
       reason,
@@ -180,7 +180,7 @@ async function sourceRequisition(
       exceptionType: ExceptionType.NO_SUPPLIER_FOUND,
       metadata: { productName: requirement.productName, matchStatus: match.status },
     });
-    return { requisitionId, status: "FAILED", selectedSupplierId: null, reason, skipped: false };
+    return toFailureResult({ organizationId, requisitionId, reason, failed });
   }
 
   const constraints: SourcingConstraints = {
@@ -197,7 +197,7 @@ async function sourceRequisition(
 
   if (!selected) {
     const reason = summarizeRejections(candidates);
-    await applySourcingFailure({
+    const failed = await applySourcingFailure({
       organizationId,
       requisitionId,
       reason,
@@ -205,7 +205,7 @@ async function sourceRequisition(
       exceptionType: ExceptionType.NO_SUPPLIER_FOUND,
       metadata: { productId: match.product.id, evaluated: candidates.length },
     });
-    return { requisitionId, status: "FAILED", selectedSupplierId: null, reason, skipped: false };
+    return toFailureResult({ organizationId, requisitionId, reason, failed });
   }
 
   // The winner is final from here on. Gemini only describes it.
@@ -265,7 +265,9 @@ async function handleTechnicalFailure(
     `Requisition ${params.requisitionId}: supplier discovery giving up after ${maxAttempts} attempts — ${params.reason}`,
   );
 
-  await applySourcingFailure({
+  // False when the requisition had already moved past sourcing — a stale
+  // delivery must not be reported as a failure that actually happened.
+  const failed = await applySourcingFailure({
     organizationId: params.organizationId,
     requisitionId: params.requisitionId,
     reason: params.reason,
@@ -273,11 +275,43 @@ async function handleTechnicalFailure(
     exceptionType: ExceptionType.SYSTEM_FAILURE,
   });
 
+  return toFailureResult({ ...params, failed });
+}
+
+/**
+ * Shapes the result of a sourcing failure, honouring whether the guarded claim
+ * in applySourcingFailure actually moved the requisition.
+ *
+ * `failed: false` means a stale job reached a requisition that had already been
+ * sourced — nothing was written, so reporting FAILED would be a lie. The real
+ * status is re-read instead.
+ */
+async function toFailureResult(params: {
+  organizationId: string;
+  requisitionId: string;
+  reason: string;
+  failed: boolean;
+}): Promise<SupplierDiscoveryResult> {
+  if (params.failed) {
+    return {
+      requisitionId: params.requisitionId,
+      status: RequisitionStatus.FAILED,
+      selectedSupplierId: null,
+      reason: params.reason,
+      skipped: false,
+    };
+  }
+
+  const current = await loadRequisitionForSourcing({
+    organizationId: params.organizationId,
+    requisitionId: params.requisitionId,
+  });
+
   return {
     requisitionId: params.requisitionId,
-    status: "FAILED",
+    status: current.status,
     selectedSupplierId: null,
     reason: params.reason,
-    skipped: false,
+    skipped: true,
   };
 }

@@ -97,6 +97,44 @@ function normalizeSku(value: string): string {
 }
 
 /**
+ * Shortest normalized SKU allowed to be recognised inside a longer string.
+ *
+ * A whole-string SKU equality check is safe at any length, but finding a SKU
+ * *within* free text needs the identifier to be distinctive enough that the hit
+ * cannot be a coincidence. A three-character SKU like "KB1" would collide with
+ * ordinary wording; "prphkb001" cannot.
+ */
+const MIN_EMBEDDED_SKU_LENGTH = 6;
+
+/**
+ * True when `text` names this SKU — either it *is* the SKU, or it quotes the SKU
+ * alongside other wording.
+ *
+ * The embedded case is what makes a printed invoice line resolvable. Purchase
+ * order lines are described as "Wireless Keyboard (PRPH-KB-001)" — name plus
+ * SKU — and that is exactly what a supplier prints and what
+ * generateInvoiceForPurchaseOrder renders. Scored on name tokens alone, the SKU
+ * is three extra tokens the catalog name does not have, so it *lowers* the
+ * score: "Wireless Keyboard (PRPH-KB-001)" scores 0.58 against the product
+ * "Wireless Keyboard" and falls under the 0.6 threshold, while the bare name
+ * scores 1.0. Quoting the unique identifier must never make a line harder to
+ * identify, so a SKU found in the text is treated as the identifier it is.
+ */
+function namesSku(normalizedText: string, sku: string): boolean {
+  const normalizedSku = normalizeSku(sku);
+
+  if (normalizedSku.length === 0) {
+    return false;
+  }
+
+  if (normalizedText === normalizedSku) {
+    return true;
+  }
+
+  return normalizedSku.length >= MIN_EMBEDDED_SKU_LENGTH && normalizedText.includes(normalizedSku);
+}
+
+/**
  * Blended two-way token coverage in [0, 1]. Penalises both an under-specific
  * match (the query asked for things the product does not have) and an
  * over-broad one (the product is mostly words the query never mentioned).
@@ -147,8 +185,8 @@ export function findBestProduct(
 
   const scored = products.map((product) => ({
     product,
-    // An exact SKU is an unambiguous identifier — it outranks any name overlap.
-    score: normalizeSku(product.sku) === skuQuery ? 1 : scoreProductName(queryTokens, product.name),
+    // A SKU is an unambiguous identifier — it outranks any name overlap.
+    score: namesSku(skuQuery, product.sku) ? 1 : scoreProductName(queryTokens, product.name),
     categoryMatch:
       normalizedCategory !== null && product.category.toLowerCase() === normalizedCategory,
   }));

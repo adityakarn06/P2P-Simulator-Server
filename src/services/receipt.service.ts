@@ -8,8 +8,14 @@ import {
   type ReceiptQuantities,
   receiptStatus,
 } from "../rules/receiptRules.js";
+import {
+  computeReliabilityScore,
+  type DeliveryObservation,
+  deliveryDeltas,
+  nextAverageLeadTime,
+} from "../rules/supplierPerformance.js";
 import { AppError } from "../utils/AppError.js";
-import { GOODS_RECEIPT_ENTITY, recordAudit } from "./audit.service.js";
+import { GOODS_RECEIPT_ENTITY, recordAudit, SUPPLIER_ENTITY } from "./audit.service.js";
 import {
   type PurchaseOrderView,
   purchaseOrderViewSelect,
@@ -82,6 +88,11 @@ const shipmentWithContextSelect = {
     select: {
       id: true,
       status: true,
+      supplierId: true,
+      // Start of the lead-time clock: the supplier could not ship before the
+      // buyer approved. Falls back to the PO's creation in updateSupplierPerformance.
+      approvedAt: true,
+      createdAt: true,
       items: {
         orderBy: { createdAt: "asc" },
         select: { id: true, productId: true, quantity: true },
@@ -392,6 +403,20 @@ export async function recordGoodsReceipt(
       },
     });
 
+    // Runs inside the same transaction as the receipt, and only on this
+    // branch — the replay above returns before reaching here, so a
+    // re-delivered request can never count the same delivery twice.
+    await updateSupplierPerformance(tx, {
+      organizationId,
+      supplierId: shipment.purchaseOrder.supplierId,
+      observation: {
+        expectedDeliveryDate: shipment.expectedDeliveryDate,
+        deliveredAt: receivedAt,
+        orderedAt: shipment.purchaseOrder.approvedAt ?? shipment.purchaseOrder.createdAt,
+        lines,
+      },
+    });
+
     const updatedShipment = await tx.shipment.findUniqueOrThrow({
       where: { id: shipmentId },
       select: shipmentViewSelect,
@@ -403,6 +428,100 @@ export async function recordGoodsReceipt(
       goodsReceipt,
       purchaseOrder: await loadPurchaseOrderView(tx, shipment.purchaseOrder.id),
     };
+  });
+}
+
+/**
+ * Folds a delivery into the supplier's OTIF record and recomputes the
+ * reliability score that ranks it on the next requisition
+ * (src/rules/supplierRanking.ts reads exactly this column).
+ *
+ * Two writes rather than one on purpose. The counters move through Prisma's
+ * atomic `increment`, because two shipments from the same supplier can be
+ * received concurrently and a read-modify-write would lose one of them. The
+ * derived score is then computed from the row those increments returned, so it
+ * always reflects counters that actually landed.
+ *
+ * Deterministic throughout: src/rules/supplierPerformance.ts owns every
+ * decision, this function only moves rows.
+ */
+async function updateSupplierPerformance(
+  tx: Pick<Prisma.TransactionClient, "supplier" | "auditLog">,
+  params: {
+    organizationId: string;
+    supplierId: string;
+    observation: DeliveryObservation;
+  },
+): Promise<void> {
+  const { organizationId, supplierId, observation } = params;
+  const deltas = deliveryDeltas(observation);
+
+  const counted = await tx.supplier.update({
+    where: { id: supplierId },
+    data: {
+      totalDeliveries: { increment: deltas.totalDeliveries },
+      onTimeDeliveries: { increment: deltas.onTimeDeliveries },
+      inFullDeliveries: { increment: deltas.inFullDeliveries },
+      orderedUnits: { increment: deltas.orderedUnits },
+      acceptedUnits: { increment: deltas.acceptedUnits },
+      damagedUnits: { increment: deltas.damagedUnits },
+    },
+    select: {
+      id: true,
+      reliabilityScore: true,
+      baselineReliability: true,
+      totalDeliveries: true,
+      onTimeDeliveries: true,
+      inFullDeliveries: true,
+      orderedUnits: true,
+      acceptedUnits: true,
+      damagedUnits: true,
+      avgLeadTimeDays: true,
+    },
+  });
+
+  // First delivery for a supplier onboarded before this column existed: its
+  // current score *is* the seeded baseline, so capture it now rather than
+  // shrinking toward a score that has already started moving.
+  const baseline = counted.baselineReliability ?? counted.reliabilityScore;
+
+  const reliabilityScore = computeReliabilityScore(counted, baseline);
+
+  await tx.supplier.update({
+    where: { id: supplierId },
+    data: {
+      reliabilityScore,
+      baselineReliability: baseline,
+      lastDeliveryAt: observation.deliveredAt,
+      avgLeadTimeDays: nextAverageLeadTime(
+        counted.avgLeadTimeDays,
+        // The increment already landed, so the stored count includes this
+        // delivery; the running mean needs the count from before it.
+        counted.totalDeliveries - deltas.totalDeliveries,
+        observation,
+      ),
+    },
+  });
+
+  // The score moving is what changes future sourcing, so it is auditable in its
+  // own right rather than buried in the receipt's metadata.
+  await recordAudit(tx, {
+    organizationId,
+    actorType: "SYSTEM",
+    action: "SUPPLIER_PERFORMANCE_UPDATED",
+    entityType: SUPPLIER_ENTITY,
+    entityId: supplierId,
+    metadata: {
+      previousReliabilityScore: counted.reliabilityScore,
+      reliabilityScore,
+      baselineReliability: baseline,
+      onTime: deltas.onTimeDeliveries === 1,
+      inFull: deltas.inFullDeliveries === 1,
+      totalDeliveries: counted.totalDeliveries,
+      orderedUnits: deltas.orderedUnits,
+      acceptedUnits: deltas.acceptedUnits,
+      damagedUnits: deltas.damagedUnits,
+    },
   });
 }
 

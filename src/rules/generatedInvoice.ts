@@ -73,10 +73,14 @@ export function buildGeneratedInvoiceLines(
     }
     if (
       !Number.isInteger(override.quantity) ||
-      override.quantity < 0 ||
+      // At least 1, never 0: a zero-quantity line bills nothing and produces a
+      // lineTotalPaise of 0 — the exact ₹0 shape approvalRules.ts rejects on a
+      // purchase-order line, because compareRelative in threeWayMatch.ts treats
+      // an expected 0 as "equality wins" and would pass the check on no money.
+      override.quantity < 1 ||
       override.quantity > MAX_MONEY_PAISE
     ) {
-      throw AppError.validation("Invoice line quantity must be a non-negative integer", {
+      throw AppError.validation("Invoice line quantity must be a positive integer", {
         purchaseOrderItemId: override.purchaseOrderItemId,
         quantity: override.quantity,
         maxQuantity: MAX_MONEY_PAISE,

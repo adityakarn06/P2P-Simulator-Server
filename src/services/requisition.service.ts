@@ -30,7 +30,12 @@ function toJson(value: unknown): Prisma.InputJsonValue {
 }
 
 /** Statuses past the conversational phase — further chat messages are rejected. */
-const CLOSED_STATUSES: RequisitionStatus[] = [
+/**
+ * Statuses the conversation can no longer be reopened from. Exported so the
+ * requisition worker can return early on a re-delivered job rather than calling
+ * Gemini again and rewinding a requisition that already has a purchase order.
+ */
+export const CLOSED_STATUSES: RequisitionStatus[] = [
   RequisitionStatus.REQUIREMENTS_EXTRACTED,
   RequisitionStatus.SUPPLIER_SELECTED,
   RequisitionStatus.PO_CREATED,
@@ -155,7 +160,13 @@ function toSourcingView(requisition: RequisitionDetailRow) {
 
 export interface RequisitionChatResult {
   requisitionId: string;
-  status: "NEEDS_CLARIFICATION" | "PROCESSING" | "REQUIREMENTS_EXTRACTED";
+  /**
+   * The requisition's real status. Widened from the three conversational
+   * statuses because a re-delivered job can legitimately find the requisition
+   * already SUPPLIER_SELECTED, PO_CREATED or FAILED, and reporting one of those
+   * as a clarification turn would be a lie.
+   */
+  status: RequisitionStatus;
   message: string;
   missingFields: string[];
   conflicts: string[];
@@ -265,7 +276,27 @@ export async function applyExtractionResult(params: {
   if (complete) {
     const requirements = toRequirementInput(draft);
 
-    await prisma.$transaction(async (tx) => {
+    const applied = await prisma.$transaction(async (tx) => {
+      // Claimed first, before any other write in this transaction. Guarded on
+      // PROCESSING — the only status the worker may write out of — so a stalled
+      // job redelivered after the requisition has been sourced cannot drag it
+      // back to REQUIREMENTS_EXTRACTED and re-run discovery. Nothing else runs
+      // when the claim finds nothing, so there is no write to roll back.
+      const claimed = await tx.requisition.updateMany({
+        where: { id: requisitionId, organizationId, status: RequisitionStatus.PROCESSING },
+        data: {
+          status: RequisitionStatus.REQUIREMENTS_EXTRACTED,
+          draftRequirements: toJson(draft),
+          clarificationMessage: COMPLETE_MESSAGE,
+          missingFields: [],
+          conflicts: [],
+        },
+      });
+
+      if (claimed.count === 0) {
+        return false;
+      }
+
       await tx.requirement.upsert({
         where: { requisitionId },
         create: {
@@ -293,17 +324,6 @@ export async function applyExtractionResult(params: {
         },
       });
 
-      await tx.requisition.update({
-        where: { id: requisitionId },
-        data: {
-          status: RequisitionStatus.REQUIREMENTS_EXTRACTED,
-          draftRequirements: toJson(draft),
-          clarificationMessage: COMPLETE_MESSAGE,
-          missingFields: [],
-          conflicts: [],
-        },
-      });
-
       await tx.requisitionMessage.create({
         data: { organizationId, requisitionId, role: "ASSISTANT", content: COMPLETE_MESSAGE },
       });
@@ -316,7 +336,13 @@ export async function applyExtractionResult(params: {
         entityId: requisitionId,
         metadata: { requirements: toJson(requirements) },
       });
+
+      return true;
     });
+
+    if (!applied) {
+      return currentStateResult({ organizationId, requisitionId });
+    }
 
     return {
       requisitionId,
@@ -333,9 +359,9 @@ export async function applyExtractionResult(params: {
   const fallback = buildClarificationMessage(result.intent, missingFields, conflicts);
   const message = isUsableClarification(result.userMessage) ? result.userMessage : fallback;
 
-  await prisma.$transaction(async (tx) => {
-    await tx.requisition.update({
-      where: { id: requisitionId },
+  const applied = await prisma.$transaction(async (tx) => {
+    const claimed = await tx.requisition.updateMany({
+      where: { id: requisitionId, organizationId, status: RequisitionStatus.PROCESSING },
       data: {
         status: RequisitionStatus.NEEDS_CLARIFICATION,
         draftRequirements: toJson(draft),
@@ -344,6 +370,10 @@ export async function applyExtractionResult(params: {
         conflicts,
       },
     });
+
+    if (claimed.count === 0) {
+      return false;
+    }
 
     await tx.requisitionMessage.create({
       data: { organizationId, requisitionId, role: "ASSISTANT", content: message },
@@ -357,7 +387,13 @@ export async function applyExtractionResult(params: {
       entityId: requisitionId,
       metadata: { intent: result.intent, missingFields, conflicts },
     });
+
+    return true;
   });
+
+  if (!applied) {
+    return currentStateResult({ organizationId, requisitionId });
+  }
 
   return {
     requisitionId,
@@ -385,9 +421,9 @@ export async function applyFallbackClarification(params: {
   const missingFields = findMissingFields(draft);
   const message = buildClarificationMessage("UNCLEAR", missingFields, []);
 
-  await prisma.$transaction(async (tx) => {
-    await tx.requisition.update({
-      where: { id: requisitionId },
+  const applied = await prisma.$transaction(async (tx) => {
+    const claimed = await tx.requisition.updateMany({
+      where: { id: requisitionId, organizationId, status: RequisitionStatus.PROCESSING },
       data: {
         status: RequisitionStatus.NEEDS_CLARIFICATION,
         clarificationMessage: message,
@@ -396,6 +432,13 @@ export async function applyFallbackClarification(params: {
         failureReason: reason,
       },
     });
+
+    // This runs inside the worker's terminal failure handler. Throwing here
+    // would escape that handler and turn a handled degradation into an
+    // unhandled job failure, so a lost claim reports state instead.
+    if (claimed.count === 0) {
+      return false;
+    }
 
     await tx.requisitionMessage.create({
       data: { organizationId, requisitionId, role: "ASSISTANT", content: message },
@@ -425,7 +468,13 @@ export async function applyFallbackClarification(params: {
       entityId: requisitionId,
       metadata: { stage: "requisition", reason },
     });
+
+    return true;
   });
+
+  if (!applied) {
+    return currentStateResult({ organizationId, requisitionId });
+  }
 
   return {
     requisitionId,
@@ -445,6 +494,40 @@ function isUsableClarification(message: string): boolean {
   return !/\b(maxUnitPricePaise|deliveryDays|productName|missingRequiredFields|null)\b/.test(
     message,
   );
+}
+
+/**
+ * The conversational reply for a requisition this job is no longer allowed to
+ * write to.
+ *
+ * A lost claim is not an error: another turn, or another delivery of this job,
+ * legitimately moved the requisition on. Throwing here would escape the worker
+ * uncaught, burn BullMQ's remaining attempts on more Gemini calls, and surface
+ * to the caller of POST /requisitions as a 500 — so the current state is
+ * reported instead, exactly as the supplier-discovery worker does for its own
+ * lost claim.
+ */
+async function currentStateResult(params: {
+  organizationId: string;
+  requisitionId: string;
+}): Promise<RequisitionChatResult> {
+  const current = await prisma.requisition.findFirst({
+    where: { id: params.requisitionId, organizationId: params.organizationId },
+    select: { status: true, clarificationMessage: true, missingFields: true, conflicts: true },
+  });
+
+  if (!current) {
+    throw AppError.notFound("Requisition not found");
+  }
+
+  return {
+    requisitionId: params.requisitionId,
+    status: current.status,
+    message: current.clarificationMessage ?? `Requisition is ${current.status}.`,
+    missingFields: current.missingFields,
+    conflicts: current.conflicts,
+    requirements: null,
+  };
 }
 
 export async function loadRequisitionForProcessing(params: {
@@ -511,7 +594,9 @@ export async function listRequisitions(params: {
       createdAt: true,
       updatedAt: true,
     },
-    orderBy: { createdAt: "desc" },
+    // createdAt alone is not unique, so a page boundary landing inside a tie
+    // could repeat or skip rows; id breaks the tie deterministically.
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     take: limit + 1,
     ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });

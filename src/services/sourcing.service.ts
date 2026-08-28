@@ -151,7 +151,7 @@ export async function applySourcingSuccess(params: {
 
     // A previous partial run leaves rows behind; replacing them wholesale keeps
     // the job idempotent without depending on per-row upserts.
-    await tx.supplierCandidate.deleteMany({ where: { requisitionId } });
+    await tx.supplierCandidate.deleteMany({ where: { requisitionId, organizationId } });
     await tx.supplierCandidate.createMany({
       data: candidates.map((candidate) =>
         toCandidateRow({ organizationId, requisitionId, candidate }),
@@ -202,6 +202,14 @@ export async function applySourcingSuccess(params: {
 /**
  * Terminal failure path. Ineligible candidates are still persisted so a buyer
  * can see exactly why every supplier was rejected.
+ *
+ * Guarded on REQUIREMENTS_EXTRACTED, the only status sourcing may fail out of.
+ * A late or re-delivered discovery job can otherwise reach here long after the
+ * requisition has moved on, and an unguarded write would drag a requisition
+ * that already has a purchase order to FAILED and file a bogus exception
+ * against it. Returns false when nothing moved, so the caller can tell a real
+ * failure from a stale one. Mirrors applyPurchaseOrderFailure in
+ * src/services/purchaseOrder.service.ts.
  */
 export async function applySourcingFailure(params: {
   organizationId: string;
@@ -210,11 +218,29 @@ export async function applySourcingFailure(params: {
   candidates: RankedCandidate[];
   exceptionType: typeof ExceptionType.NO_SUPPLIER_FOUND | typeof ExceptionType.SYSTEM_FAILURE;
   metadata?: Prisma.InputJsonValue;
-}): Promise<void> {
+}): Promise<boolean> {
   const { organizationId, requisitionId, reason, candidates, exceptionType, metadata } = params;
 
-  await prisma.$transaction(async (tx) => {
-    await tx.supplierCandidate.deleteMany({ where: { requisitionId } });
+  return prisma.$transaction(async (tx) => {
+    // Claimed first: nothing else in this transaction should run for a
+    // requisition that has already moved past sourcing.
+    const claimed = await tx.requisition.updateMany({
+      where: {
+        id: requisitionId,
+        organizationId,
+        status: RequisitionStatus.REQUIREMENTS_EXTRACTED,
+      },
+      data: { status: RequisitionStatus.FAILED, failureReason: reason },
+    });
+
+    if (claimed.count === 0) {
+      console.warn(
+        `Requisition ${requisitionId}: sourcing failure ignored, requisition is no longer awaiting sourcing — ${reason}`,
+      );
+      return false;
+    }
+
+    await tx.supplierCandidate.deleteMany({ where: { requisitionId, organizationId } });
     if (candidates.length > 0) {
       await tx.supplierCandidate.createMany({
         data: candidates.map((candidate) =>
@@ -222,11 +248,6 @@ export async function applySourcingFailure(params: {
         ),
       });
     }
-
-    await tx.requisition.update({
-      where: { id: requisitionId },
-      data: { status: RequisitionStatus.FAILED, failureReason: reason },
-    });
 
     await recordException(tx, {
       organizationId,
@@ -250,6 +271,8 @@ export async function applySourcingFailure(params: {
       entityId: requisitionId,
       metadata: { stage: "supplier-discovery", reason },
     });
+
+    return true;
   });
 }
 
