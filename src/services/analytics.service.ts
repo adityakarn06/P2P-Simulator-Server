@@ -5,6 +5,7 @@ import {
   InvoiceSource,
   InvoiceStatus,
   MatchStatus,
+  PaymentKind,
   PaymentStatus,
   PurchaseOrderStatus,
   RequisitionStatus,
@@ -183,6 +184,18 @@ export interface AnalyticsSummary {
     committed: Money;
     paid: Money;
     blocked: Money;
+    /**
+     * Invoices settled for less than they asked for — the money saved by paying
+     * for what actually arrived rather than what was billed.
+     *
+     * `count` is invoices, not payment rows, and `shortfall` is billed minus
+     * everything settled against each one. An invoice partially paid and then
+     * topped up to its full amount therefore contributes nothing to the
+     * shortfall, which is the honest answer.
+     */
+    partialSettlements: { count: number; paid: Money; shortfall: Money };
+    /** Committed but not yet settled: the organization's outstanding liability. */
+    unsettledCommitment: Money;
     topSuppliers: { supplierId: string; supplierName: string; orders: number; total: Money }[];
   };
   ai: {
@@ -335,7 +348,15 @@ async function loadCycleTimes(
             take: 1,
             select: {
               createdAt: true,
-              payment: { select: { completedAt: true } },
+              // An invoice settled in tranches is "paid" when the last one
+              // lands, so the cycle time measures the whole settlement rather
+              // than a partial payment that left a balance outstanding.
+              payments: {
+                where: { status: PaymentStatus.COMPLETED },
+                orderBy: { completedAt: "desc" },
+                take: 1,
+                select: { completedAt: true },
+              },
             },
           },
         },
@@ -358,7 +379,7 @@ async function loadCycleTimes(
     }
 
     const invoice = purchaseOrder.invoices.at(0) ?? null;
-    const paidAt = invoice?.payment?.completedAt ?? null;
+    const paidAt = invoice?.payments.at(0)?.completedAt ?? null;
 
     push(buckets.requisitionToPurchaseOrder, requisition.createdAt, purchaseOrder.createdAt);
     push(buckets.purchaseOrderToApproval, purchaseOrder.createdAt, purchaseOrder.approvedAt);
@@ -445,7 +466,7 @@ async function loadSpend(
   where: { organizationId: string; createdAt?: Prisma.DateTimeFilter },
   currency: string,
 ): Promise<AnalyticsSummary["spend"]> {
-  const [committed, paid, blocked, bySupplier] = await Promise.all([
+  const [committed, paid, blocked, partial, bySupplier] = await Promise.all([
     // Everything actually ordered: a rejected purchase order committed nothing.
     prisma.purchaseOrder.aggregate({
       where: { ...where, status: { not: PurchaseOrderStatus.REJECTED } },
@@ -458,6 +479,29 @@ async function loadSpend(
     prisma.payment.aggregate({
       where: { ...where, status: PaymentStatus.BLOCKED },
       _sum: { amountPaise: true },
+    }),
+    // Grouped by invoice, not by payment. The shortfall is a property of the
+    // invoice — billed minus the sum of every tranche settling it — so counting
+    // it per PARTIAL row would double-count an invoice paid in two instalments
+    // and would still report a large "saved" figure for one eventually settled
+    // in full.
+    //
+    // Only COMPLETED tranches count. One still in flight has saved nothing yet,
+    // and one that failed never will.
+    prisma.invoice.findMany({
+      where: {
+        organizationId,
+        payments: {
+          some: { ...where, status: PaymentStatus.COMPLETED, kind: PaymentKind.PARTIAL },
+        },
+      },
+      select: {
+        totalPaise: true,
+        payments: {
+          where: { status: PaymentStatus.COMPLETED },
+          select: { amountPaise: true },
+        },
+      },
     }),
     prisma.purchaseOrder.groupBy({
       by: ["supplierId"],
@@ -475,10 +519,32 @@ async function loadSpend(
   });
   const namesById = new Map(suppliers.map((supplier) => [supplier.id, supplier.name]));
 
+  const partialSettled = partial.map((invoice) => ({
+    totalPaise: invoice.totalPaise,
+    paidPaise: invoice.payments.reduce((total, row) => total + row.amountPaise, 0),
+  }));
+
+  const partialPaidPaise = partialSettled.reduce((total, row) => total + row.paidPaise, 0);
+  const partialShortfallPaise = partialSettled.reduce(
+    (total, row) =>
+      total + (row.totalPaise === null ? 0 : Math.max(0, row.totalPaise - row.paidPaise)),
+    0,
+  );
+
+  const committedPaise = committed._sum.totalPaise ?? 0;
+  const paidPaise = paid._sum.amountPaise ?? 0;
+
   return {
-    committed: money(committed._sum.totalPaise ?? 0, currency),
-    paid: money(paid._sum.amountPaise ?? 0, currency),
+    committed: money(committedPaise, currency),
+    paid: money(paidPaise, currency),
     blocked: money(blocked._sum.amountPaise ?? 0, currency),
+    partialSettlements: {
+      // Invoices touched by a partial settlement, not tranches.
+      count: partialSettled.length,
+      paid: money(partialPaidPaise, currency),
+      shortfall: money(partialShortfallPaise, currency),
+    },
+    unsettledCommitment: money(Math.max(0, committedPaise - paidPaise), currency),
     topSuppliers: bySupplier.map((row) => ({
       supplierId: row.supplierId,
       supplierName: namesById.get(row.supplierId) ?? "Unknown supplier",

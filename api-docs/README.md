@@ -7,11 +7,11 @@ is `/api/v1` (e.g. `POST /api/v1/requisitions`).
 | Stage | Doc | Endpoints it covers |
 | --- | --- | --- |
 | 1. Requisition intake (chat) | [`requisitions-api.md`](./requisitions-api.md) | `POST /requisitions`, `POST /requisitions/:id/messages`, `GET /requisitions/:id`, `GET /requisitions` |
-| 2. Supplier discovery | [`sourcing-api.md`](./sourcing-api.md) | none — read through `GET /requisitions/:id` |
+| 2. Supplier discovery | [`sourcing-api.md`](./sourcing-api.md), [`suppliers-api.md`](./suppliers-api.md) | `GET /suppliers`, `GET /suppliers/:id`, `GET /suppliers/:id/products`, `GET /products`, `GET /products/:id` |
 | 3. Purchase order | [`purchase-orders-api.md`](./purchase-orders-api.md) | `POST /purchase-orders/:id/approve`, `POST /purchase-orders/:id/reject`, `GET /purchase-orders/:id`, `GET /purchase-orders` |
 | 4. Shipment & goods receipt | [`shipments-api.md`](./shipments-api.md), [`receipts-api.md`](./receipts-api.md) | `GET /shipments`, `GET /shipments/:id`, `POST /receipts/simulate`, `GET /receipts` |
 | 5. Invoice upload & extraction | [`invoices-api.md`](./invoices-api.md) | `POST /invoices`, `GET /invoices/:id`, `GET /invoices` |
-| 6. Matching, payment, exceptions | [`exceptions-api.md`](./exceptions-api.md) | `GET /exceptions`, `GET /exceptions/:id`, `POST /exceptions/:id/resolve` |
+| 6. Matching, payment, exceptions | [`exceptions-api.md`](./exceptions-api.md), [`payments-api.md`](./payments-api.md) | `GET /exceptions`, `GET /exceptions/:id`, `POST /exceptions/:id/resolve`, `GET /payments`, `GET /payments/:id` |
 | Cross-cutting: activity log | [`audit-logs-api.md`](./audit-logs-api.md) | `GET /audit-logs` |
 | Cross-cutting: dashboard | [`analytics-api.md`](./analytics-api.md) | `GET /analytics/summary`, `GET /analytics/suppliers`, `GET /analytics/anomalies` |
 
@@ -54,8 +54,11 @@ is `/api/v1` (e.g. `POST /api/v1/requisitions`).
         ├─▶ automatic — payment worker      APPROVED ──▶ PAID
         │
         └─▶ POST /exceptions/:id/resolve   human override
+                         └─▶ APPROVE          → EXCEPTION → APPROVED → payment → PAID
+                         └─▶ PARTIAL_APPROVE  → pay only the approved amount → PARTIALLY_PAID
+                                                (the order keeps its balance for a follow-up
+                                                 invoice — see payments-api.md)
                          └─▶ releasedForPayment: true when it was the last open exception
-                                 → EXCEPTION → APPROVED → automatic payment → PAID
 ```
 
 Every stage after the initial `POST /requisitions` call is either:

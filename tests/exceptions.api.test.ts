@@ -14,8 +14,9 @@ const db = {
     updateMany: vi.fn(),
     count: vi.fn(),
   },
-  invoice: { updateMany: vi.fn() },
-  payment: { updateMany: vi.fn() },
+  invoice: { updateMany: vi.fn(), findFirst: vi.fn() },
+  payment: { updateMany: vi.fn(), aggregate: vi.fn() },
+  matchCheck: { findMany: vi.fn() },
   auditLog: { create: vi.fn() },
 };
 
@@ -103,7 +104,32 @@ beforeEach(() => {
   db.exception.count.mockResolvedValue(0);
   db.invoice.updateMany.mockResolvedValue({ count: 1 });
   db.payment.updateMany.mockResolvedValue({ count: 1 });
+  db.payment.aggregate.mockResolvedValue({ _sum: { amountPaise: null } });
+  db.matchCheck.findMany.mockResolvedValue([]);
+  db.invoice.findFirst.mockResolvedValue(buildInvoiceForSettlement());
 });
+
+/**
+ * The purchase order behind the exception: 100 keyboards ordered at ₹1,820,
+ * 98 delivered with 2 damaged, so 96 were accepted.
+ */
+function buildInvoiceForSettlement(overrides: Record<string, unknown> = {}) {
+  return {
+    totalPaise: 21_476_000,
+    purchaseOrder: {
+      id: "po-1",
+      poNumber: "PO-20260824-ABC123",
+      currency: "INR",
+      totalPaise: 21_476_000,
+      taxRateBps: 1800,
+      items: [{ id: "poi-1", unitPricePaise: 182_000 }],
+      shipment: {
+        goodsReceipt: { items: [{ purchaseOrderItemId: "poi-1", acceptedQuantity: 96 }] },
+      },
+    },
+    ...overrides,
+  };
+}
 
 describe("GET /api/v1/exceptions", () => {
   it("lists exceptions for the caller's organization", async () => {
@@ -218,6 +244,210 @@ describe("GET /api/v1/exceptions/:id", () => {
     expect(res.status).toBe(404);
     expect(res.body.error.code).toBe("NOT_FOUND");
   });
+
+  // Without these two, the operator can see that the match failed but not why,
+  // and has no figure to approve — which is the whole partial-payment decision.
+  it("returns the checks that actually failed", async () => {
+    db.matchCheck.findMany.mockResolvedValue([
+      {
+        checkType: "RECEIVED_QUANTITY",
+        expected: "100",
+        actual: "96",
+        variance: -0.04,
+        severity: "CRITICAL",
+      },
+    ]);
+
+    const res = await detail(EXCEPTION);
+
+    expect(res.body.data.exception.failedChecks).toHaveLength(1);
+    expect(res.body.data.exception.failedChecks[0].checkType).toBe("RECEIVED_QUANTITY");
+    expect(db.matchCheck.findMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { passed: false, threeWayMatch: { invoiceId: INVOICE } },
+    });
+  });
+
+  it("suggests paying for the 96 units that were accepted, at the order's own price", async () => {
+    const res = await detail(EXCEPTION);
+
+    // 96 x 182_000 = 17_472_000, +18% tax = 20_616_960.
+    expect(res.body.data.exception.settlement).toMatchObject({
+      poNumber: "PO-20260824-ABC123",
+      invoiceTotalPaise: 21_476_000,
+      invoiceOutstandingPaise: 21_476_000,
+      purchaseOrderOutstandingPaise: 21_476_000,
+      suggestedAmountPaise: 20_616_960,
+    });
+  });
+
+  it("suggests nothing when the goods never arrived", async () => {
+    db.invoice.findFirst.mockResolvedValue(
+      buildInvoiceForSettlement({
+        purchaseOrder: {
+          ...buildInvoiceForSettlement().purchaseOrder,
+          shipment: null,
+        },
+      }),
+    );
+
+    const res = await detail(EXCEPTION);
+
+    expect(res.body.data.exception.settlement.suggestedAmountPaise).toBeNull();
+  });
+
+  it("never suggests more than the purchase order has left", async () => {
+    db.payment.aggregate.mockResolvedValue({ _sum: { amountPaise: 21_000_000 } });
+
+    const res = await detail(EXCEPTION);
+
+    expect(res.body.data.exception.settlement.suggestedAmountPaise).toBe(476_000);
+  });
+
+  it.each([["the invoice is already fully settled", { _sum: { amountPaise: 21_476_000 } }]])(
+    "suggests nothing when %s",
+    async (_case, aggregate) => {
+      // evaluateSettlement would refuse it outright, and an operator who approves
+      // an unpayable figure sees the payment silently not happen.
+      db.payment.aggregate.mockResolvedValue(aggregate);
+
+      const res = await detail(EXCEPTION);
+
+      expect(res.body.data.exception.settlement.suggestedAmountPaise).toBeNull();
+    },
+  );
+
+  it("suggests nothing when the invoice total was never extracted", async () => {
+    db.invoice.findFirst.mockResolvedValue(buildInvoiceForSettlement({ totalPaise: null }));
+
+    const res = await detail(EXCEPTION);
+
+    expect(res.body.data.exception.settlement.suggestedAmountPaise).toBeNull();
+  });
+
+  it("carries no settlement for an exception that is not about an invoice", async () => {
+    db.exception.findFirst.mockResolvedValue(
+      buildException({ entityType: "PurchaseOrder", entityId: "po-1" }),
+    );
+
+    const res = await detail(EXCEPTION);
+
+    expect(res.body.data.exception.settlement).toBeNull();
+    expect(res.body.data.exception.failedChecks).toEqual([]);
+    expect(db.matchCheck.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /api/v1/exceptions/:id/resolve — partial approval", () => {
+  it("queues a tranche for the approved amount, keyed on the exception", async () => {
+    const res = await resolve(EXCEPTION, {
+      decision: "PARTIAL_APPROVE",
+      approvedAmountPaise: 20_616_960,
+      reason: "Supplier confirmed the 4-unit shortfall; pay for what arrived.",
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.approvedAmountPaise).toBe(20_616_960);
+
+    expect(enqueuePayment).toHaveBeenCalledWith({
+      invoiceId: INVOICE,
+      organizationId: ORG,
+      settlementKey: `exc-${EXCEPTION}`,
+      amountPaise: 20_616_960,
+      authorization: {
+        exceptionId: EXCEPTION,
+        userId: "dev-user",
+        reason: "Supplier confirmed the 4-unit shortfall; pay for what arrived.",
+      },
+    });
+  });
+
+  it("closes the exception as RESOLVED, exactly like a full approval", async () => {
+    await resolve(EXCEPTION, {
+      decision: "PARTIAL_APPROVE",
+      approvedAmountPaise: 20_616_960,
+      reason: "Supplier confirmed the 4-unit shortfall.",
+    });
+
+    expect(lastUpdateStatus).toBe("RESOLVED");
+  });
+
+  it("records the approved amount on the audit row", async () => {
+    await resolve(EXCEPTION, {
+      decision: "PARTIAL_APPROVE",
+      approvedAmountPaise: 20_616_960,
+      reason: "Supplier confirmed the 4-unit shortfall.",
+    });
+
+    const resolution = db.auditLog.create.mock.calls
+      .map((call) => (call[0] as { data: { action: string; metadata: unknown } }).data)
+      .find((data) => data.action === "EXCEPTION_RESOLVED");
+
+    expect(resolution?.metadata).toMatchObject({
+      decision: "PARTIAL_APPROVE",
+      approvedAmountPaise: 20_616_960,
+    });
+  });
+
+  // The "auto" row matching parked carries the whole purchase order total and
+  // nothing will ever enqueue a job for it. Releasing it would leave a PENDING
+  // payment for the full amount that no worker processes.
+  it("leaves the automatic full-value payment BLOCKED", async () => {
+    await resolve(EXCEPTION, {
+      decision: "PARTIAL_APPROVE",
+      approvedAmountPaise: 20_616_960,
+      reason: "Supplier confirmed the 4-unit shortfall.",
+    });
+
+    const unblocked = db.payment.updateMany.mock.calls.filter(
+      (call) => (call[0] as { data: { status: string } }).data.status === "PENDING",
+    );
+    expect(unblocked).toHaveLength(0);
+  });
+
+  it("still unblocks it on a full approval", async () => {
+    await resolve(EXCEPTION, {
+      decision: "APPROVE",
+      reason: "Discrepancy accepted; pay the invoice as billed.",
+    });
+
+    const unblocked = db.payment.updateMany.mock.calls.filter(
+      (call) => (call[0] as { data: { status: string } }).data.status === "PENDING",
+    );
+    expect(unblocked).toHaveLength(1);
+  });
+
+  it("refuses a partial approval with no amount", async () => {
+    const res = await resolve(EXCEPTION, {
+      decision: "PARTIAL_APPROVE",
+      reason: "Pay for what arrived, please.",
+    });
+
+    expect(res.status).toBe(400);
+    expect(enqueuePayment).not.toHaveBeenCalled();
+  });
+
+  it("refuses an amount on a full approval rather than ignoring it", async () => {
+    // Silently dropping a number someone typed into a payment request is how
+    // the wrong sum gets paid.
+    const res = await resolve(EXCEPTION, {
+      decision: "APPROVE",
+      approvedAmountPaise: 20_616_960,
+      reason: "Approving the whole invoice as billed.",
+    });
+
+    expect(res.status).toBe(400);
+    expect(enqueuePayment).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, 1.5])("refuses %s as an approved amount", async (approvedAmountPaise) => {
+    const res = await resolve(EXCEPTION, {
+      decision: "PARTIAL_APPROVE",
+      approvedAmountPaise,
+      reason: "Pay for what arrived, please.",
+    });
+
+    expect(res.status).toBe(400);
+  });
 });
 
 describe("POST /api/v1/exceptions/:id/resolve — approve", () => {
@@ -242,7 +472,11 @@ describe("POST /api/v1/exceptions/:id/resolve — approve", () => {
     expect(auditActions()).toEqual(["EXCEPTION_RESOLVED", "PAYMENT_APPROVED"]);
 
     expect(enqueuePayment).toHaveBeenCalledTimes(1);
-    expect(enqueuePayment).toHaveBeenCalledWith({ invoiceId: INVOICE, organizationId: ORG });
+    expect(enqueuePayment).toHaveBeenCalledWith({
+      invoiceId: INVOICE,
+      organizationId: ORG,
+      settlementKey: "auto",
+    });
   });
 
   it("records the actor from the dev tenant and the given reason", async () => {

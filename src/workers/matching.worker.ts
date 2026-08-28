@@ -1,4 +1,5 @@
 import type { Job } from "bullmq";
+import { AUTO_SETTLEMENT_KEY } from "../config/constants.js";
 import { InvoiceSource, InvoiceStatus, MatchStatus } from "../generated/prisma/enums.js";
 import { enqueuePayment } from "../queues/payment.queue.js";
 import { threeWayMatch } from "../rules/threeWayMatch.js";
@@ -64,9 +65,9 @@ export async function processMatchingJob(job: Job): Promise<MatchingResult> {
       if (
         existing === MatchStatus.MATCHED &&
         context.status === InvoiceStatus.APPROVED &&
-        !context.payment
+        context.payments.length === 0
       ) {
-        await enqueuePayment({ invoiceId, organizationId });
+        await enqueuePayment({ invoiceId, organizationId, settlementKey: AUTO_SETTLEMENT_KEY });
       }
 
       return {
@@ -111,7 +112,7 @@ export async function processMatchingJob(job: Job): Promise<MatchingResult> {
     // Enqueued after the transaction commits, never inside it — and never at
     // all for a mismatch, whose payment row is already BLOCKED.
     if (status === MatchStatus.MATCHED) {
-      await enqueuePayment({ invoiceId, organizationId });
+      await enqueuePayment({ invoiceId, organizationId, settlementKey: AUTO_SETTLEMENT_KEY });
     }
 
     return { invoiceId, status };

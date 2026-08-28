@@ -119,7 +119,8 @@ short-lived link — it works for a `GENERATED` PDF and an `UPLOADED` PDF/PNG/JP
 | `MATCHING` | Three-way matching running | spinner — transient, usually resolves quickly (no AI call in this stage) |
 | `APPROVED` | Match passed, or a human overrode a mismatch | payment is queued automatically |
 | `EXCEPTION` | Match failed | fetch `GET /exceptions?entityId={invoiceId}` — see `api-docs/exceptions-api.md` |
-| `PAID` | Settled | terminal, success state |
+| `PARTIALLY_PAID` | Some, but not all, of the invoice has been settled | show the amount paid against the amount billed; the balance is still owed. Reached only through a human-authorized partial payment (`PARTIAL_APPROVE`) — see `api-docs/payments-api.md` |
+| `PAID` | Settled in full | terminal, success state |
 
 `extractionAttempts` counts how many times the worker has tried, so a slow extraction can show
 "attempt 2 of 3" rather than an indefinite spinner.

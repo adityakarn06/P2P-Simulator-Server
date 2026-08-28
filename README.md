@@ -132,8 +132,10 @@ Deliberate, but worth knowing before you build on them.
   Cloudinary-only, behind `StorageProvider`), Clerk, Socket.IO, and a structured logger. Polling and
   `console.log` are the reality; see the note at the top of `CLAUDE.md`.
 - **A purchase order never closes.** `PurchaseOrderStatus.SHIPPED` and `COMPLETED` are never
-  written — a PO stops at `RECEIVED` even after its invoice is paid. In supply-chain terms that
-  means there is no open-commitment figure.
+  written — a PO stops at `RECEIVED` even after its invoice is paid. The open-commitment figure is
+  derived instead, from the settled tranches against the order (`loadSettlementLedger` in
+  `src/services/payment.service.ts`, surfaced as `spend.unsettledCommitment` on
+  `GET /analytics/summary`), rather than read off a status.
 - **`ShipmentStatus.CREATED` is never written** — approval inserts the shipment directly at
   `IN_TRANSIT`. `ExceptionType.REQUIREMENT_INCOMPLETE` is likewise never raised; incomplete
   requirements are handled conversationally instead.
@@ -141,7 +143,12 @@ Deliberate, but worth knowing before you build on them.
   `ExceptionType` describes them. Documented in `threeWayMatch.ts`, but it does mislabel a business
   problem as a technical one on the exceptions screen.
 - **Exception `REJECT` is a dead end.** The invoice stays `EXCEPTION` with a `BLOCKED` payment and
-  no further path — no re-match, no partial settlement, no credit note.
+  no further path — no re-match and no credit note. `APPROVE` and `PARTIAL_APPROVE` do have a path:
+  the latter settles a human-approved amount and leaves the order's balance open for a follow-up
+  invoice (see `api-docs/payments-api.md`).
+- **Nothing reconciles a purchase order that is deliberately left short-paid.** After a partial
+  settlement the remaining balance stays outstanding forever unless another invoice arrives to
+  claim it; there is no "close this order short" action and no write-off.
 - **Requisitions are single-line.** `src/zod/requisition.schema.ts` carries one `productName` and
   one `quantity`. Purchase orders, receipts and three-way matching all already handle multiple
   lines; only intake is constrained.

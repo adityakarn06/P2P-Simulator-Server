@@ -9,7 +9,7 @@ const db = {
   purchaseOrder: { groupBy: vi.fn(), aggregate: vi.fn() },
   purchaseOrderItem: { findMany: vi.fn() },
   invoice: { groupBy: vi.fn(), count: vi.fn(), findMany: vi.fn() },
-  payment: { groupBy: vi.fn(), aggregate: vi.fn() },
+  payment: { groupBy: vi.fn(), aggregate: vi.fn(), findMany: vi.fn() },
   threeWayMatch: { count: vi.fn() },
   exception: { groupBy: vi.fn(), findMany: vi.fn() },
   supplier: { findMany: vi.fn() },
@@ -50,6 +50,7 @@ function emptyDatabase(): void {
   db.invoice.findMany.mockResolvedValue([]);
   db.payment.groupBy.mockResolvedValue([]);
   db.payment.aggregate.mockResolvedValue({ _sum: { amountPaise: null } });
+  db.payment.findMany.mockResolvedValue([]);
   db.threeWayMatch.count.mockResolvedValue(0);
   db.exception.groupBy.mockResolvedValue([]);
   db.exception.findMany.mockResolvedValue([]);
@@ -93,7 +94,14 @@ describe("GET /api/v1/analytics/summary", () => {
 
   it("counts an invoice that was reviewed by a human as not touchless", async () => {
     db.invoice.count.mockResolvedValue(2);
-    db.invoice.findMany.mockResolvedValue([{ id: "inv-clean" }, { id: "inv-reviewed" }]);
+    // Two callers now ask invoice.findMany different questions: the touchless
+    // stat wants terminal invoices, the spend stat wants those with a partial
+    // settlement. Answer by the query rather than returning one shape to both.
+    db.invoice.findMany.mockImplementation((args: { where: Record<string, unknown> }) =>
+      Promise.resolve(
+        "payments" in args.where ? [] : [{ id: "inv-clean" }, { id: "inv-reviewed" }],
+      ),
+    );
     // An exception was raised against inv-reviewed and later resolved. The two
     // callers of exception.findMany ask different questions, so the mock
     // answers by the query rather than returning one shape to both.
@@ -139,7 +147,7 @@ describe("GET /api/v1/analytics/summary", () => {
           invoices: [
             {
               createdAt: new Date("2026-08-26T04:00:00.000Z"),
-              payment: { completedAt: new Date("2026-08-26T05:00:00.000Z") },
+              payments: [{ completedAt: new Date("2026-08-26T05:00:00.000Z") }],
             },
           ],
         },

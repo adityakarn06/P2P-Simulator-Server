@@ -1,4 +1,10 @@
-import { InvoiceStatus, MatchStatus, PaymentStatus } from "../generated/prisma/enums.js";
+import {
+  InvoiceStatus,
+  MatchStatus,
+  type PaymentKind,
+  PaymentStatus,
+} from "../generated/prisma/enums.js";
+import { evaluateSettlement, type SettlementLedger } from "./settlementRules.js";
 
 /**
  * The deterministic gate that decides whether an invoice may be settled.
@@ -12,28 +18,38 @@ import { InvoiceStatus, MatchStatus, PaymentStatus } from "../generated/prisma/e
  * normally rather than throwing, because retrying it would never change it.
  */
 
-export type PaymentDecision = { payable: true } | { payable: false; reason: string };
+export type PaymentDecision =
+  | { payable: true; amountPaise: number; kind: PaymentKind }
+  | { payable: false; reason: string };
 
 export interface PaymentGateInput {
   invoiceStatus: InvoiceStatus;
   /** Null when the invoice has never been through three-way matching. */
   matchStatus: MatchStatus | null;
-  /** Null when no Payment row exists yet. */
+  /** Null when no Payment row exists yet for this settlement key. */
   paymentStatus: PaymentStatus | null;
   /** Exceptions still OPEN or UNDER_REVIEW against this invoice. */
   openExceptionCount: number;
   /**
-   * True when a *different* invoice against the same purchase order already
-   * holds or has completed a payment.
+   * What has already been settled against this invoice and against the purchase
+   * order it belongs to.
    *
-   * Every matched invoice is settled for `purchaseOrder.totalPaise` — the
-   * buyer's own commitment — and `Payment` is unique on `invoiceId`, not on
-   * `purchaseOrderId`. Nothing else in the chain stops two separately-numbered
-   * invoices raised against one purchase order from each passing all twelve
-   * checks: DUPLICATE_INVOICE only catches a repeated invoice *number*. Without
-   * this flag the order gets paid twice, in full.
+   * This replaces an earlier boolean, "has a sibling invoice already been
+   * paid?", which refused a second invoice on an order outright. That was the
+   * only thing stopping a supplier from splitting one order across two invoices
+   * and being paid twice in full — but it also made legitimate progressive
+   * billing impossible, and it meant a short delivery could only ever be paid
+   * for the whole order. The cumulative cap does the same job without either
+   * limitation: what protects the buyer is the order's remaining balance, not
+   * the number of documents raised against it.
    */
-  purchaseOrderAlreadySettled: boolean;
+  ledger: SettlementLedger;
+  /**
+   * The amount a human authorized while resolving an exception, or null for the
+   * automatic settlement that follows a clean match (which takes whatever is
+   * outstanding).
+   */
+  requestedAmountPaise: number | null;
 }
 
 /**
@@ -64,7 +80,11 @@ export function evaluatePayment(input: PaymentGateInput): PaymentDecision {
     return { payable: false, reason: "Invoice is already paid" };
   }
 
-  if (invoiceStatus !== InvoiceStatus.APPROVED) {
+  // PARTIALLY_PAID is payable: some of this invoice has already been settled by
+  // an earlier tranche and the rest is still owed. It reaches this gate the same
+  // way APPROVED does — through a resolved exception or a clean match — so it
+  // gets the same scrutiny, and the ledger below decides what is left to pay.
+  if (invoiceStatus !== InvoiceStatus.APPROVED && invoiceStatus !== InvoiceStatus.PARTIALLY_PAID) {
     return { payable: false, reason: `Invoice is ${invoiceStatus}, not APPROVED` };
   }
 
@@ -85,20 +105,35 @@ export function evaluatePayment(input: PaymentGateInput): PaymentDecision {
     return { payable: false, reason: "Payment has already completed" };
   }
 
-  // Checked after the invoice's own payment status so "this invoice is already
-  // paid" is never reported as a sibling's payment. Deliberately last: it is
-  // the only refusal that is about a document other than this one.
-  if (input.purchaseOrderAlreadySettled) {
-    return {
-      payable: false,
-      reason: "Another invoice against this purchase order has already been paid",
-    };
+  // The arithmetic goes last, so a refusal about the invoice's own state is
+  // never reported as a balance problem. This is also the only refusal that can
+  // be about a document other than this one: a sibling invoice may have spent
+  // the purchase order's remaining balance.
+  const settlement = evaluateSettlement({
+    ledger: input.ledger,
+    requestedAmountPaise: input.requestedAmountPaise,
+  });
+
+  if (!settlement.settle) {
+    return { payable: false, reason: settlement.reason };
   }
 
   // Reaching here on a MISMATCHED match means a human approved it above.
   // PENDING, PROCESSING (this job's own earlier attempt), FAILED (retryable),
   // BLOCKED (unblocked by that same approval) and null all proceed.
-  return { payable: true };
+  return { payable: true, amountPaise: settlement.amountPaise, kind: settlement.kind };
+}
+
+/**
+ * True when the purchase order has no budget left, which is what a duplicate
+ * invoice against an already-settled order looks like from the payment gate.
+ *
+ * Distinguished from every other refusal because it is the one a human has to
+ * see: two documents were raised against one order and the second cannot be
+ * paid. The worker raises a DUPLICATE_INVOICE exception on it.
+ */
+export function isOverBilling(ledger: SettlementLedger): boolean {
+  return ledger.purchaseOrderSettledPaise >= ledger.purchaseOrderTotalPaise;
 }
 
 /** True when settling this invoice overrides a failed match rather than following one. */

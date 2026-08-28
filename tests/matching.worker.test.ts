@@ -58,7 +58,7 @@ function buildContext(
     invoiceQuantity?: number;
     invoiceUnitPricePaise?: number;
     threeWayMatch?: { id: string; status: string } | null;
-    payment?: { id: string; status: string } | null;
+    payments?: { id: string; settlementKey: string; status: string }[];
     status?: string;
   } = {},
 ) {
@@ -90,7 +90,7 @@ function buildContext(
       },
     ],
     threeWayMatch: overrides.threeWayMatch ?? null,
-    payment: overrides.payment ?? null,
+    payments: overrides.payments ?? [],
     purchaseOrder: {
       id: "po-1",
       poNumber: "PO-20260824-ABC123",
@@ -208,7 +208,11 @@ describe("processMatchingJob — matched", () => {
     expect(invoiceStatusWrittenBy(db.invoice.updateMany.mock.calls.at(-1))).toBe("APPROVED");
 
     expect(enqueuePayment).toHaveBeenCalledTimes(1);
-    expect(enqueuePayment).toHaveBeenCalledWith({ invoiceId: INVOICE, organizationId: ORG });
+    expect(enqueuePayment).toHaveBeenCalledWith({
+      invoiceId: INVOICE,
+      organizationId: ORG,
+      settlementKey: "auto",
+    });
 
     expect(db.exception.upsert).not.toHaveBeenCalled();
     expect(db.payment.upsert).not.toHaveBeenCalled();
@@ -229,10 +233,14 @@ describe("processMatchingJob — mismatched", () => {
     expect(invoiceStatusWrittenBy(db.invoice.updateMany.mock.calls.at(-1))).toBe("EXCEPTION");
 
     const payment = firstArg(db.payment.upsert) as {
-      where: { invoiceId: string };
+      where: { invoiceId_settlementKey: { invoiceId: string; settlementKey: string } };
       create: { status: string; amountPaise: number; currency: string; blockedReason: string };
     };
-    expect(payment.where).toEqual({ invoiceId: INVOICE });
+    // Keyed on the automatic tranche, so a later human-authorized partial
+    // payment gets its own row rather than overwriting this block.
+    expect(payment.where).toEqual({
+      invoiceId_settlementKey: { invoiceId: INVOICE, settlementKey: "auto" },
+    });
     expect(payment.create.status).toBe("BLOCKED");
     // The purchase order's own total, never the AI-transcribed invoice figure.
     expect(payment.create.amountPaise).toBe(21_476_000);
@@ -277,7 +285,7 @@ describe("processMatchingJob — idempotency", () => {
       buildContext({
         status: "APPROVED",
         threeWayMatch: { id: "match-1", status: "MATCHED" },
-        payment: { id: "pay-1", status: "COMPLETED" },
+        payments: [{ id: "pay-1", settlementKey: "auto", status: "COMPLETED" }],
       }),
     );
 
@@ -295,7 +303,7 @@ describe("processMatchingJob — idempotency", () => {
       buildContext({
         status: "APPROVED",
         threeWayMatch: { id: "match-1", status: "MATCHED" },
-        payment: null,
+        payments: [],
       }),
     );
 
@@ -312,7 +320,7 @@ describe("processMatchingJob — idempotency", () => {
       buildContext({
         status: "EXCEPTION",
         threeWayMatch: { id: "match-1", status: "MISMATCHED" },
-        payment: { id: "pay-1", status: "BLOCKED" },
+        payments: [{ id: "pay-1", settlementKey: "auto", status: "BLOCKED" }],
       }),
     );
 

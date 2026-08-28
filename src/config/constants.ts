@@ -61,6 +61,13 @@ export const APPROVAL_THRESHOLDS_PAISE = {
  */
 export const PAYMENT_CLAIM_LEASE_MS = 120_000;
 
+/**
+ * The settlement key of the automatic payment that follows a clean three-way
+ * match. Every other tranche of an invoice is a human-authorized partial
+ * payment, keyed on the exception that authorized it.
+ */
+export const AUTO_SETTLEMENT_KEY = "auto";
+
 // Three-way match tolerances.
 export const MATCH_TOLERANCES = {
   QUANTITY: 0,

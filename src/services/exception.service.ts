@@ -4,9 +4,11 @@ import {
   ExceptionStatus,
   ExceptionType,
   InvoiceStatus,
+  type MatchCheckType,
   PaymentStatus,
   type Severity,
 } from "../generated/prisma/enums.js";
+import { describeSettlement, suggestPartialSettlement } from "../rules/settlementRules.js";
 import { AppError } from "../utils/AppError.js";
 import { EXCEPTION_ENTITY, INVOICE_ENTITY, recordAudit } from "./audit.service.js";
 
@@ -203,10 +205,50 @@ const exceptionViewSelect = {
 
 export type ExceptionView = Prisma.ExceptionGetPayload<{ select: typeof exceptionViewSelect }>;
 
+/**
+ * What an operator needs in order to decide an invoice exception: which of the
+ * twelve checks actually failed, and what settling it would cost.
+ *
+ * Attached only to invoice exceptions — every other type is decided without
+ * money moving, and loading a settlement for them would be noise.
+ */
+export interface ExceptionSettlementContext {
+  purchaseOrderId: string;
+  poNumber: string;
+  currency: string;
+  invoiceTotalPaise: number | null;
+  invoiceSettledPaise: number;
+  invoiceOutstandingPaise: number;
+  purchaseOrderTotalPaise: number;
+  purchaseOrderSettledPaise: number;
+  purchaseOrderOutstandingPaise: number;
+  /**
+   * What the goods that actually arrived are worth at the purchase order's own
+   * agreed prices — the natural answer to a short delivery, offered so the
+   * operator does not have to do the arithmetic that authorizes a payment.
+   *
+   * Advisory. Whatever they approve is re-checked against both balances before
+   * anything is charged. Null when nothing has been received yet, since there
+   * would be nothing to pay for.
+   */
+  suggestedAmountPaise: number | null;
+}
+
+export interface ExceptionDetail extends ExceptionView {
+  failedChecks: {
+    checkType: MatchCheckType;
+    expected: string | null;
+    actual: string | null;
+    variance: number | null;
+    severity: Severity;
+  }[];
+  settlement: ExceptionSettlementContext | null;
+}
+
 export async function getExceptionById(params: {
   organizationId: string;
   exceptionId: string;
-}): Promise<ExceptionView> {
+}): Promise<ExceptionDetail> {
   const exception = await prisma.exception.findFirst({
     where: { id: params.exceptionId, organizationId: params.organizationId },
     select: exceptionViewSelect,
@@ -216,7 +258,124 @@ export async function getExceptionById(params: {
     throw AppError.notFound("Exception not found");
   }
 
-  return exception;
+  if (exception.entityType !== INVOICE_ENTITY) {
+    return { ...exception, failedChecks: [], settlement: null };
+  }
+
+  const [invoice, failedChecks] = await Promise.all([
+    prisma.invoice.findFirst({
+      where: { id: exception.entityId, organizationId: params.organizationId },
+      select: {
+        totalPaise: true,
+        purchaseOrder: {
+          select: {
+            id: true,
+            poNumber: true,
+            currency: true,
+            totalPaise: true,
+            taxRateBps: true,
+            items: { select: { id: true, unitPricePaise: true } },
+            shipment: {
+              select: {
+                goodsReceipt: {
+                  select: {
+                    items: { select: { purchaseOrderItemId: true, acceptedQuantity: true } },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    }),
+    prisma.matchCheck.findMany({
+      where: { passed: false, threeWayMatch: { invoiceId: exception.entityId } },
+      select: {
+        checkType: true,
+        expected: true,
+        actual: true,
+        variance: true,
+        severity: true,
+      },
+    }),
+  ]);
+
+  if (!invoice) {
+    return { ...exception, failedChecks, settlement: null };
+  }
+
+  const purchaseOrder = invoice.purchaseOrder;
+  const settled = { in: [PaymentStatus.PROCESSING, PaymentStatus.COMPLETED] };
+
+  const [invoiceSettled, orderSettled] = await Promise.all([
+    prisma.payment.aggregate({
+      _sum: { amountPaise: true },
+      where: {
+        organizationId: params.organizationId,
+        invoiceId: exception.entityId,
+        status: settled,
+      },
+    }),
+    prisma.payment.aggregate({
+      _sum: { amountPaise: true },
+      where: {
+        organizationId: params.organizationId,
+        purchaseOrderId: purchaseOrder.id,
+        status: settled,
+      },
+    }),
+  ]);
+
+  const view = describeSettlement({
+    invoiceTotalPaise: invoice.totalPaise,
+    invoiceSettledPaise: invoiceSettled._sum.amountPaise ?? 0,
+    purchaseOrderTotalPaise: purchaseOrder.totalPaise,
+    purchaseOrderSettledPaise: orderSettled._sum.amountPaise ?? 0,
+  });
+
+  const acceptedByItemId = new Map(
+    (purchaseOrder.shipment?.goodsReceipt?.items ?? []).map((item) => [
+      item.purchaseOrderItemId,
+      item.acceptedQuantity,
+    ]),
+  );
+
+  const suggestionLines = purchaseOrder.items.map((item) => ({
+    unitPricePaise: item.unitPricePaise,
+    acceptedQuantity: acceptedByItemId.get(item.id) ?? 0,
+  }));
+
+  // Every reason evaluateSettlement would refuse the suggestion outright.
+  // Offering a figure the payment worker will always reject is worse than
+  // offering none — the operator approves it, and the payment silently does
+  // not happen.
+  const suggestible =
+    suggestionLines.some((line) => line.acceptedQuantity > 0) &&
+    view.invoiceTotalPaise !== null &&
+    view.invoiceOutstandingPaise > 0 &&
+    view.purchaseOrderOutstandingPaise > 0;
+
+  return {
+    ...exception,
+    failedChecks,
+    settlement: {
+      purchaseOrderId: purchaseOrder.id,
+      poNumber: purchaseOrder.poNumber,
+      currency: purchaseOrder.currency,
+      ...view,
+      suggestedAmountPaise: suggestible
+        ? Math.min(
+            suggestPartialSettlement({
+              lines: suggestionLines,
+              taxRateBps: purchaseOrder.taxRateBps,
+            }),
+            // Never suggest more than either balance allows.
+            view.invoiceOutstandingPaise,
+            view.purchaseOrderOutstandingPaise,
+          )
+        : null,
+    },
+  };
 }
 
 export async function listExceptions(params: {
@@ -272,13 +431,20 @@ export function countOpenExceptions(params: {
 // API: resolve
 // ---------------------------------------------------------------------------
 
-export type ExceptionDecision = "APPROVE" | "REJECT";
+export type ExceptionDecision = "APPROVE" | "PARTIAL_APPROVE" | "REJECT";
+
+/** Both approvals release the invoice; only the amount they authorize differs. */
+function isApproval(decision: ExceptionDecision): boolean {
+  return decision === "APPROVE" || decision === "PARTIAL_APPROVE";
+}
 
 export interface ResolveExceptionByIdInput {
   organizationId: string;
   exceptionId: string;
   decision: ExceptionDecision;
   reason: string;
+  /** Set only on PARTIAL_APPROVE. A request, not an authorization — see below. */
+  approvedAmountPaise?: number;
   actorId: string;
 }
 
@@ -287,6 +453,17 @@ export interface ResolveExceptionResult {
   /** True when this resolution released an invoice for payment. */
   releasedForPayment: boolean;
   invoiceId: string | null;
+  /**
+   * The amount the operator approved, passed through to the payment job. Null
+   * on a full approval, which settles whatever is outstanding.
+   *
+   * Deliberately not validated against the ledger here: this transaction is
+   * about recording a decision, and the balances it would check can change
+   * before the payment worker runs. The worker re-derives them and refuses an
+   * amount that no longer fits, so an over-approval is caught where it matters
+   * rather than at the moment someone typed it.
+   */
+  approvedAmountPaise: number | null;
 }
 
 /**
@@ -308,7 +485,7 @@ export interface ResolveExceptionResult {
 export async function resolveExceptionById(
   input: ResolveExceptionByIdInput,
 ): Promise<ResolveExceptionResult> {
-  const { organizationId, exceptionId, decision, reason, actorId } = input;
+  const { organizationId, exceptionId, decision, reason, approvedAmountPaise, actorId } = input;
 
   return prisma.$transaction(async (tx) => {
     const exception = await tx.exception.findFirst({
@@ -353,7 +530,7 @@ export async function resolveExceptionById(
         status: { in: [ExceptionStatus.OPEN, ExceptionStatus.UNDER_REVIEW] },
       },
       data: {
-        status: decision === "APPROVE" ? ExceptionStatus.RESOLVED : ExceptionStatus.REJECTED,
+        status: isApproval(decision) ? ExceptionStatus.RESOLVED : ExceptionStatus.REJECTED,
         resolution: decision,
         resolutionReason: reason,
         resolvedAt: new Date(),
@@ -390,6 +567,7 @@ export async function resolveExceptionById(
       metadata: {
         decision,
         reason,
+        approvedAmountPaise: approvedAmountPaise ?? null,
         type: exception.type,
         entityType: exception.entityType,
         entityId: exception.entityId,
@@ -398,8 +576,13 @@ export async function resolveExceptionById(
 
     const isInvoiceException = exception.entityType === INVOICE_ENTITY;
 
-    if (decision !== "APPROVE" || !isInvoiceException) {
-      return { exception: resolved, releasedForPayment: false, invoiceId: null };
+    if (!isApproval(decision) || !isInvoiceException) {
+      return {
+        exception: resolved,
+        releasedForPayment: false,
+        invoiceId: null,
+        approvedAmountPaise: null,
+      };
     }
 
     const invoiceId = exception.entityId;
@@ -414,7 +597,12 @@ export async function resolveExceptionById(
     });
 
     if (stillOpen > 0) {
-      return { exception: resolved, releasedForPayment: false, invoiceId };
+      return {
+        exception: resolved,
+        releasedForPayment: false,
+        invoiceId,
+        approvedAmountPaise: null,
+      };
     }
 
     // Guarded on EXCEPTION so this can only ever release an invoice that
@@ -425,15 +613,33 @@ export async function resolveExceptionById(
     });
 
     if (released.count === 0) {
-      return { exception: resolved, releasedForPayment: false, invoiceId };
+      return {
+        exception: resolved,
+        releasedForPayment: false,
+        invoiceId,
+        approvedAmountPaise: null,
+      };
     }
 
-    // Unblock the payment matching parked. PENDING, not PROCESSING: the payment
-    // worker still has to claim it, and still re-checks the gate first.
-    await tx.payment.updateMany({
-      where: { invoiceId, organizationId, status: PaymentStatus.BLOCKED },
-      data: { status: PaymentStatus.PENDING, blockedReason: null },
-    });
+    // Unblock the payment matching parked — but only on a full approval.
+    //
+    // A PARTIAL_APPROVE settles its own tranche, keyed on this exception. The
+    // "auto" row matching wrote carries the whole purchase order total, and
+    // nothing will ever enqueue a job for it: releasing it here would leave a
+    // PENDING payment for the full amount that no worker processes, showing up
+    // in GET /payments as outstanding money and waiting to be claimed at that
+    // stale figure by any later re-drive. It stays BLOCKED, which is what it
+    // is — the full-value settlement was refused, and a smaller one was
+    // authorized instead.
+    //
+    // PENDING, not PROCESSING: the payment worker still has to claim it, and
+    // still re-checks the gate first.
+    if (decision === "APPROVE") {
+      await tx.payment.updateMany({
+        where: { invoiceId, organizationId, status: PaymentStatus.BLOCKED },
+        data: { status: PaymentStatus.PENDING, blockedReason: null },
+      });
+    }
 
     await recordAudit(tx, {
       organizationId,
@@ -442,9 +648,20 @@ export async function resolveExceptionById(
       action: "PAYMENT_APPROVED",
       entityType: INVOICE_ENTITY,
       entityId: invoiceId,
-      metadata: { via: "exception-override", exceptionId, reason },
+      metadata: {
+        via: "exception-override",
+        exceptionId,
+        reason,
+        decision,
+        approvedAmountPaise: approvedAmountPaise ?? null,
+      },
     });
 
-    return { exception: resolved, releasedForPayment: true, invoiceId };
+    return {
+      exception: resolved,
+      releasedForPayment: true,
+      invoiceId,
+      approvedAmountPaise: approvedAmountPaise ?? null,
+    };
   });
 }

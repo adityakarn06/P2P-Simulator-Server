@@ -1,3 +1,4 @@
+import { AUTO_SETTLEMENT_KEY } from "../config/constants.js";
 import { prisma } from "../config/prisma.js";
 import type { Prisma } from "../generated/prisma/client.js";
 import {
@@ -56,7 +57,7 @@ const matchingContextSelect = {
     orderBy: { lineNumber: "asc" },
   },
   threeWayMatch: { select: { id: true, status: true } },
-  payment: { select: { id: true, status: true } },
+  payments: { select: { id: true, settlementKey: true, status: true } },
   purchaseOrder: {
     select: {
       id: true,
@@ -354,14 +355,20 @@ export async function applyMatchResult(params: ApplyMatchResultParams): Promise<
     if (!matched) {
       const blockedReason = describeFailures(result.checks);
 
-      // Payment.invoiceId @unique makes this upsert the idempotent way to
-      // record the block. amountPaise comes from the purchase order — the
-      // buyer's own deterministic figure — never from the AI-read invoice.
+      // The unique pair (invoiceId, settlementKey) makes this upsert the
+      // idempotent way to record the block against the automatic tranche.
+      //
+      // The amount is a placeholder for the UI, not an authorization: this row
+      // is BLOCKED, and the payment worker recomputes what may actually be
+      // settled from the ledger before anything moves. It stays the purchase
+      // order total — the buyer's own deterministic commitment — so the figure
+      // a human is first shown is never one Gemini read off the invoice.
       await tx.payment.upsert({
-        where: { invoiceId },
+        where: { invoiceId_settlementKey: { invoiceId, settlementKey: AUTO_SETTLEMENT_KEY } },
         create: {
           organizationId,
           invoiceId,
+          settlementKey: AUTO_SETTLEMENT_KEY,
           purchaseOrderId: purchaseOrder.id,
           amountPaise: purchaseOrder.totalPaise,
           currency: purchaseOrder.currency,

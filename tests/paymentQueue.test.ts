@@ -48,15 +48,23 @@ beforeEach(() => {
  * keeps two of them from being in flight at once.
  */
 describe("enqueuePayment", () => {
-  it("keys the job on the invoice so concurrent enqueues collapse into one", async () => {
+  it("keys the job on the invoice and tranche so concurrent enqueues collapse into one", async () => {
     await enqueuePayment({ invoiceId: INVOICE, organizationId: ORG });
 
-    expect(addOptions().jobId).toBe(`payment-${INVOICE}`);
+    expect(addOptions().jobId).toBe(`payment-${INVOICE}-auto`);
   });
 
   // BullMQ reserves ":" for its own Redis key structure and rejects a custom id
   // containing one at runtime ("Custom Id cannot contain :") — which no mocked
   // queue would ever surface.
+  it("gives each tranche of an invoice its own job id", async () => {
+    // Keyed on the invoice alone, BullMQ would collapse a human-authorized
+    // partial payment into the automatic settlement and silently drop it.
+    await enqueuePayment({ invoiceId: INVOICE, organizationId: ORG, settlementKey: "exc-1" });
+
+    expect(addOptions().jobId).toBe(`payment-${INVOICE}-exc-1`);
+  });
+
   it("uses a job id BullMQ will accept", () => {
     expect(`payment-${INVOICE}`).not.toContain(":");
   });

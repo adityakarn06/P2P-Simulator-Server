@@ -1,4 +1,5 @@
 import type { JobsOptions } from "bullmq";
+import type { z } from "zod";
 import { QUEUE_NAMES } from "../config/constants.js";
 import { type PaymentJob, paymentJobSchema } from "../types/types.js";
 import { createQueue, enqueue } from "./connection.js";
@@ -23,13 +24,22 @@ export const PAYMENT_JOBS = {
  * genuine re-drive of the same invoice can claim the id again once the first
  * job has left the queue.
  *
+ * The settlement key is part of the id, not just the invoice. An invoice can
+ * now be settled in more than one tranche — a partial payment a human
+ * authorized, then the balance later — and those are genuinely different jobs.
+ * Keying on the invoice alone would make BullMQ collapse the second into the
+ * first and silently drop it.
+ *
  * The separator is a dash, not a colon: BullMQ reserves ":" for its own Redis
  * key structure and rejects a custom job id containing one ("Custom Id cannot
  * contain :").
  */
-export function enqueuePayment(payload: PaymentJob, opts?: JobsOptions): Promise<string> {
+export function enqueuePayment(
+  payload: z.input<typeof paymentJobSchema>,
+  opts?: JobsOptions,
+): Promise<string> {
   return enqueue(paymentQueue, PAYMENT_JOBS.PROCESS_PAYMENT, paymentJobSchema, payload, {
-    jobId: `payment-${payload.invoiceId}`,
+    jobId: `payment-${payload.invoiceId}-${payload.settlementKey ?? "auto"}`,
     ...opts,
   });
 }

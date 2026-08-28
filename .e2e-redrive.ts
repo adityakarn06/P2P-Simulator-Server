@@ -6,14 +6,14 @@ import { enqueuePayment } from "./src/queues/payment.queue.js";
 async function snapshot(invoiceId: string) {
   const inv = await prisma.invoice.findUniqueOrThrow({
     where: { id: invoiceId },
-    select: { status: true, threeWayMatch: { select: { id: true } }, payment: { select: { id: true, status: true, providerReference: true } } },
+    select: { status: true, threeWayMatch: { select: { id: true } }, payments: { select: { id: true, settlementKey: true, status: true, providerReference: true } } },
   });
   return {
     invoice: inv.status,
     matchId: inv.threeWayMatch?.id ?? null,
-    paymentId: inv.payment?.id ?? null,
-    paymentStatus: inv.payment?.status ?? null,
-    providerRef: inv.payment?.providerReference ?? null,
+    paymentId: inv.payments.at(0)?.id ?? null,
+    paymentStatus: inv.payments.at(0)?.status ?? null,
+    providerRef: inv.payments.at(0)?.providerReference ?? null,
     matches: await prisma.threeWayMatch.count({ where: { invoiceId } }),
     checks: await prisma.matchCheck.count({ where: { threeWayMatch: { invoiceId } } }),
     payments: await prisma.payment.count({ where: { invoiceId } }),

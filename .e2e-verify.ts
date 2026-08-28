@@ -16,7 +16,7 @@ async function main() {
           checks: { select: { checkType: true, passed: true, expected: true, actual: true, variance: true, severity: true }, orderBy: { checkType: "asc" } },
         },
       },
-      payment: { select: { status: true, amountPaise: true, currency: true, provider: true, providerReference: true, blockedReason: true, completedAt: true } },
+      payments: { select: { settlementKey: true, kind: true, status: true, amountPaise: true, currency: true, provider: true, providerReference: true, blockedReason: true, completedAt: true } },
     },
   });
 
@@ -27,7 +27,7 @@ async function main() {
   const m = inv.threeWayMatch;
   console.log("MATCH        :", m ? `${m.status} ${m.passedChecks}/${m.totalChecks} passed, ${m.failedChecks} failed` : "none");
   if (m) for (const c of m.checks) console.log(`   ${c.passed ? "PASS" : "FAIL"}  ${c.checkType.padEnd(18)} expected=${c.expected} actual=${c.actual}`);
-  console.log("PAYMENT      :", JSON.stringify(inv.payment));
+  console.log("PAYMENT      :", JSON.stringify(inv.payments));
 
   const exc = await prisma.exception.findMany({ where: { entityId: invoiceId }, select: { type: true, status: true, severity: true, description: true, resolution: true, resolutionReason: true } });
   console.log("EXCEPTIONS   :", exc.length === 0 ? "none" : "");

@@ -55,6 +55,10 @@ enum InvoiceStatus {
   MATCHING
   APPROVED
   EXCEPTION
+  /// Some, but not all, of the invoice has been settled. Reached only through a
+  /// human-authorized partial payment (see PaymentKind.PARTIAL); the invoice
+  /// stays payable until the settled tranches add up to its total.
+  PARTIALLY_PAID
   PAID
   FAILED
 }
@@ -78,6 +82,17 @@ enum PaymentStatus {
   COMPLETED
   FAILED
   BLOCKED
+}
+
+/**
+ * Whether a payment tranche clears its invoice outright or only part of it.
+ * FULL is the automatic post-match settlement; PARTIAL is always the result of
+ * a human resolving an exception with an explicit approved amount — a short
+ * delivery being paid for what actually arrived, most often.
+ */
+enum PaymentKind {
+  FULL
+  PARTIAL
 }
 
 enum ExceptionStatus {
@@ -250,10 +265,7 @@ model Supplier {
 
   // ---- Delivery performance (OTIF). Maintained by recordGoodsReceipt only, ----
   // exactly once per receipt, inside the transaction that creates it.
-  /**
-   * /**
-   * /** Receipts booked against this supplier. The denominator for every rate below.
-   */
+  /// Receipts booked against this supplier. The denominator for every rate below.
   totalDeliveries  Int       @default(0)
   /**
    * Deliveries where deliveredAt <= the shipment's expectedDeliveryDate.
@@ -482,6 +494,7 @@ model PurchaseOrder {
   items    PurchaseOrderItem[]
   shipment Shipment?
   invoices Invoice[]
+  payments Payment[]
 
   @@unique([organizationId, poNumber])
   @@index([organizationId])
@@ -630,7 +643,7 @@ model Invoice {
 
   items         InvoiceItem[]
   threeWayMatch ThreeWayMatch?
-  payment       Payment?
+  payments      Payment[]
 
   @@index([organizationId])
   @@index([organizationId, status])
@@ -708,17 +721,40 @@ model MatchCheck {
 }
 
 model Payment {
-  id                String        @id @default(cuid())
-  organizationId    String
-  invoiceId         String        @unique
-  purchaseOrderId   String?
+  id             String @id @default(cuid())
+  organizationId String
+  invoiceId      String
+
+  /**
+   * Identifies which settlement of the invoice this row is, so one invoice can
+   * be paid in more than one tranche. Deterministic, never random: "auto" for
+   * the automatic settlement matching releases, and "exc-<exceptionId>" for a
+   * tranche a human authorized while resolving an exception.
+   * The unique pair below replaces what used to be `invoiceId @unique`. It
+   * still lets claimPaymentForProcessing use a unique-constraint violation to
+   * settle the race between two workers, but now scoped to one tranche rather
+   * than to the whole invoice.
+   */
+  settlementKey String
+
+  purchaseOrderId   String
   amountPaise       Int
   currency          String        @default("INR")
   status            PaymentStatus @default(PENDING)
+  kind              PaymentKind   @default(FULL)
   provider          String        @default("SIMULATED")
   providerReference String?
   blockedReason     String?
   failureReason     String?
+
+  /**
+   * Who authorized a PARTIAL tranche and why, copied from the exception
+   * resolution that released it. Null on an automatic FULL settlement, which
+   * no human ever touched.
+   */
+  authorizedBy           String?
+  authorizationReason    String?
+  authorizingExceptionId String?
 
   /**
    * Identifies the attempt that currently holds the PROCESSING claim (the
@@ -736,11 +772,16 @@ model Payment {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  organization Organization @relation(fields: [organizationId], references: [id])
-  invoice      Invoice      @relation(fields: [invoiceId], references: [id])
+  organization  Organization  @relation(fields: [organizationId], references: [id])
+  invoice       Invoice       @relation(fields: [invoiceId], references: [id])
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
 
+  @@unique([invoiceId, settlementKey])
   @@index([organizationId])
   @@index([organizationId, status])
+  @@index([organizationId, kind])
+  @@index([organizationId, purchaseOrderId])
+  @@index([invoiceId])
 }
 
 // ---------------------------------------------------------------------------

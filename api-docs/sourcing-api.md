@@ -232,10 +232,13 @@ asking the user to be more specific, in a new requisition.
 
 These are planned but **not implemented** — do not build against them yet:
 
-- `GET /api/v1/suppliers`, `GET /api/v1/suppliers/:id`
 - Socket.IO events; polling is the only mechanism today
 
-Two things this doc previously listed here are now live and safe to build against:
+Three things this doc previously listed here are now live and safe to build against:
+
+- **The supplier and product catalog.** `GET /api/v1/suppliers`, `GET /api/v1/suppliers/:id`,
+  `GET /api/v1/suppliers/:id/products`, `GET /api/v1/products` and `GET /api/v1/products/:id` are
+  implemented, read-only. See `api-docs/suppliers-api.md`.
 
 - **Purchase orders.** `SUPPLIER_SELECTED` queues a purchase-order job that a worker consumes —
   `status` does progress to `PO_CREATED`. See `api-docs/purchase-orders-api.md`.

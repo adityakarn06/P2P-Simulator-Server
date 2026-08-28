@@ -21,11 +21,17 @@ export function createQueue<T>(name: QueueName): Queue<T, unknown, string, T, un
  * queue. Job payloads must carry IDs only — workers re-fetch current state
  * from PostgreSQL rather than trusting queued data.
  */
-export async function enqueue<T>(
+/**
+ * `TIn` is separate from `T` because a payload schema may carry defaults — the
+ * payment queue's `settlementKey` does — so what a caller supplies is a looser
+ * shape than what the worker receives. Parsing here is what closes the gap, and
+ * it stays the only place a job payload is validated (CLAUDE.md rule 8).
+ */
+export async function enqueue<T, TIn = T>(
   queue: Queue<T, unknown, string, T, unknown, string>,
   jobName: string,
-  schema: z.ZodType<T>,
-  payload: T,
+  schema: z.ZodType<T, TIn>,
+  payload: TIn,
   opts?: JobsOptions,
 ): Promise<string> {
   const parsed = schema.safeParse(payload);

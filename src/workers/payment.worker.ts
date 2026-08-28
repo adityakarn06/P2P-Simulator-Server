@@ -1,7 +1,7 @@
 import type { Job } from "bullmq";
 import { InvoiceStatus, PaymentStatus } from "../generated/prisma/enums.js";
 import { getPaymentProvider } from "../payments/index.js";
-import { evaluatePayment, isOverriddenPayment } from "../rules/paymentRules.js";
+import { evaluatePayment, isOverBilling, isOverriddenPayment } from "../rules/paymentRules.js";
 import { countOpenExceptions } from "../services/exception.service.js";
 import {
   applyPaymentCompletion,
@@ -9,6 +9,7 @@ import {
   claimPaymentForProcessing,
   hasSettledSiblingInvoice,
   loadPaymentContext,
+  loadSettlementLedger,
   recordDuplicatePurchaseOrderPayment,
 } from "../services/payment.service.js";
 import { paymentJobSchema } from "../types/types.js";
@@ -18,6 +19,10 @@ import { parseJobData } from "./parseJobData.js";
 export interface PaymentResult {
   invoiceId: string;
   status: PaymentStatus | null;
+  /** Which tranche of the invoice this job was settling. */
+  settlementKey: string;
+  /** What actually moved, in paise. Absent when the job did no work. */
+  amountPaise?: number;
   /** Why the job did no work, when it did none. */
   skippedReason?: string;
 }
@@ -32,48 +37,71 @@ export interface PaymentResult {
  * attempt, so retrying it would only burn attempts.
  */
 export async function processPaymentJob(job: Job): Promise<PaymentResult> {
-  const { invoiceId, organizationId } = parseJobData(paymentJobSchema, job.data, "payment");
+  const { invoiceId, organizationId, settlementKey, amountPaise, authorization } = parseJobData(
+    paymentJobSchema,
+    job.data,
+    "payment",
+  );
 
   const context = await loadPaymentContext({ organizationId, invoiceId });
   const matchStatus = context.threeWayMatch?.status ?? null;
+  const tranche = context.payments.find((row) => row.settlementKey === settlementKey) ?? null;
 
   // Independent reads — run them together rather than one after the other.
-  const [openExceptionCount, purchaseOrderAlreadySettled] = await Promise.all([
+  const [openExceptionCount, ledger] = await Promise.all([
     countOpenExceptions({ organizationId, entityId: invoiceId }),
-    hasSettledSiblingInvoice({
+    loadSettlementLedger({
       organizationId,
       invoiceId,
+      invoiceTotalPaise: context.totalPaise,
       purchaseOrderId: context.purchaseOrder.id,
+      purchaseOrderTotalPaise: context.purchaseOrder.totalPaise,
     }),
   ]);
 
   const decision = evaluatePayment({
     invoiceStatus: context.status,
     matchStatus,
-    paymentStatus: context.payment?.status ?? null,
+    paymentStatus: tranche?.status ?? null,
     openExceptionCount,
-    purchaseOrderAlreadySettled,
+    ledger,
+    requestedAmountPaise: amountPaise ?? null,
   });
 
   if (!decision.payable) {
-    console.log(`Invoice ${invoiceId}: not paying — ${decision.reason}`);
+    console.log(`Invoice ${invoiceId} (${settlementKey}): not paying — ${decision.reason}`);
 
-    // A sibling invoice having taken the money is the one refusal a human has
-    // to see: two documents were raised against one order. Every other reason
-    // here is already visible in the invoice's own status.
-    if (purchaseOrderAlreadySettled && context.status === InvoiceStatus.APPROVED) {
-      await recordDuplicatePurchaseOrderPayment({
+    // A spent purchase order is the one refusal a human has to see: a second
+    // document was raised against an order whose committed budget is gone.
+    // Every other reason here is already visible in the invoice's own status.
+    //
+    // The sibling check is what makes it a *duplicate* rather than an ordinary
+    // settled order. An order can be fully spent by this invoice's own
+    // tranches, and raising a CRITICAL exception on the invoice that was
+    // correctly paid — then blocking its remaining rows — would be a false
+    // alarm. Only another document having taken the money is news.
+    if (isOverBilling(ledger) && isReleasedForPayment(context.status)) {
+      const settledElsewhere = await hasSettledSiblingInvoice({
         organizationId,
         invoiceId,
         purchaseOrderId: context.purchaseOrder.id,
-        poNumber: context.purchaseOrder.poNumber,
-        reason: decision.reason,
       });
+
+      if (settledElsewhere) {
+        await recordDuplicatePurchaseOrderPayment({
+          organizationId,
+          invoiceId,
+          purchaseOrderId: context.purchaseOrder.id,
+          poNumber: context.purchaseOrder.poNumber,
+          reason: decision.reason,
+        });
+      }
     }
 
     return {
       invoiceId,
-      status: context.payment?.status ?? null,
+      settlementKey,
+      status: tranche?.status ?? null,
       skippedReason: decision.reason,
     };
   }
@@ -81,18 +109,25 @@ export async function processPaymentJob(job: Job): Promise<PaymentResult> {
   const claim = await claimPaymentForProcessing({
     organizationId,
     invoiceId,
+    settlementKey,
     purchaseOrder: context.purchaseOrder,
+    invoiceTotalPaise: context.totalPaise,
+    amountPaise: decision.amountPaise,
+    kind: decision.kind,
+    authorization: authorization ?? null,
     // The BullMQ job id is stable across this job's retries, so an interrupted
     // attempt can resume its own claim without waiting out the lease.
-    claimToken: String(job.id ?? invoiceId),
+    claimToken: String(job.id ?? `${invoiceId}-${settlementKey}`),
   });
 
-  // Another worker owns this payment, or it settled between the gate and here.
+  // Another worker owns this tranche, it settled between the gate and here, or
+  // a concurrent tranche spent the order's remaining balance in between.
   if (!claim.claimed) {
     return {
       invoiceId,
-      status: context.payment?.status ?? null,
-      skippedReason: "Payment is owned by another attempt",
+      settlementKey,
+      status: tranche?.status ?? null,
+      skippedReason: claim.reason ?? "Payment is owned by another attempt",
     };
   }
 
@@ -102,18 +137,22 @@ export async function processPaymentJob(job: Job): Promise<PaymentResult> {
     // Deliberately outside any transaction: never hold a database transaction
     // open across an external call.
     ({ providerReference } = await getPaymentProvider().charge({
-      idempotencyKey: invoiceId,
+      // Keyed on the tranche, not the invoice: an invoice settled in two
+      // instalments makes two genuinely distinct charges, and a provider that
+      // honours idempotency keys must not collapse them into one.
+      idempotencyKey: `${invoiceId}:${settlementKey}`,
       amountPaise: claim.amountPaise,
       currency: claim.currency,
       reference: context.invoiceNumber ?? context.purchaseOrder.poNumber,
     }));
   } catch (error) {
-    return handleTechnicalFailure(job, { organizationId, invoiceId, error });
+    return handleTechnicalFailure(job, { organizationId, invoiceId, settlementKey, error });
   }
 
   const completed = await applyPaymentCompletion({
     organizationId,
     invoiceId,
+    settlementKey,
     providerReference,
     // Recorded on the audit row so a settled-despite-mismatch invoice is
     // greppable later, rather than looking like an ordinary clean payment.
@@ -123,12 +162,23 @@ export async function processPaymentJob(job: Job): Promise<PaymentResult> {
   if (!completed) {
     return {
       invoiceId,
+      settlementKey,
       status: PaymentStatus.COMPLETED,
       skippedReason: "Payment was already settled by another attempt",
     };
   }
 
-  return { invoiceId, status: PaymentStatus.COMPLETED };
+  return {
+    invoiceId,
+    settlementKey,
+    status: PaymentStatus.COMPLETED,
+    amountPaise: claim.amountPaise,
+  };
+}
+
+/** An invoice a human or a clean match has released — the states money can move from. */
+function isReleasedForPayment(status: InvoiceStatus): boolean {
+  return status === InvoiceStatus.APPROVED || status === InvoiceStatus.PARTIALLY_PAID;
 }
 
 /**
@@ -143,9 +193,9 @@ const PERMANENT_ERROR_CODES: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
 
 async function handleTechnicalFailure(
   job: Job,
-  params: { organizationId: string; invoiceId: string; error: unknown },
+  params: { organizationId: string; invoiceId: string; settlementKey: string; error: unknown },
 ): Promise<PaymentResult> {
-  const { organizationId, invoiceId, error } = params;
+  const { organizationId, invoiceId, settlementKey, error } = params;
   const reason = error instanceof Error ? error.message : "Payment failed";
   const maxAttempts = job.opts.attempts ?? 1;
   const isFinalAttempt = job.attemptsMade + 1 >= maxAttempts;
@@ -160,7 +210,7 @@ async function handleTechnicalFailure(
     `Invoice ${invoiceId}: payment gave up after ${job.attemptsMade + 1} attempt(s) — ${reason}`,
   );
 
-  await applyPaymentFailure({ organizationId, invoiceId, reason });
+  await applyPaymentFailure({ organizationId, invoiceId, settlementKey, reason });
 
-  return { invoiceId, status: PaymentStatus.FAILED, skippedReason: reason };
+  return { invoiceId, settlementKey, status: PaymentStatus.FAILED, skippedReason: reason };
 }

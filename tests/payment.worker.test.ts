@@ -6,9 +6,11 @@ process.env.DATABASE_URL ??= "postgresql://user:pass@localhost:5432/db";
 
 const db = {
   invoice: { findFirst: vi.fn(), updateMany: vi.fn() },
-  payment: { create: vi.fn(), updateMany: vi.fn(), count: vi.fn() },
+  payment: { create: vi.fn(), updateMany: vi.fn(), count: vi.fn(), aggregate: vi.fn() },
   exception: { upsert: vi.fn(), count: vi.fn(), findUnique: vi.fn() },
   auditLog: { create: vi.fn() },
+  // The claim locks the purchase order row before re-checking the cap.
+  $queryRaw: vi.fn(),
 };
 
 vi.mock("../src/config/prisma.js", () => ({
@@ -37,12 +39,22 @@ const { AppError } = await import("../src/utils/AppError.js");
 const ORG = "dev-org";
 const INVOICE = "inv-1";
 const PO_TOTAL_PAISE = 21_476_000;
+/** The clean case: the invoice bills exactly what the order committed. */
+const INVOICE_TOTAL_PAISE = PO_TOTAL_PAISE;
+const AUTO = "auto";
 
 function buildContext(
   overrides: {
     status?: string;
     matchStatus?: string | null;
-    payment?: { id: string; status: string; amountPaise: number; currency: string } | null;
+    totalPaise?: number | null;
+    payments?: {
+      id: string;
+      settlementKey: string;
+      status: string;
+      amountPaise: number;
+      currency: string;
+    }[];
   } = {},
 ) {
   return {
@@ -50,9 +62,10 @@ function buildContext(
     organizationId: ORG,
     status: overrides.status ?? "APPROVED",
     invoiceNumber: "INV-2026-0042",
+    totalPaise: overrides.totalPaise === undefined ? INVOICE_TOTAL_PAISE : overrides.totalPaise,
     threeWayMatch:
       overrides.matchStatus === null ? null : { status: overrides.matchStatus ?? "MATCHED" },
-    payment: overrides.payment ?? null,
+    payments: overrides.payments ?? [],
     purchaseOrder: {
       id: "po-1",
       poNumber: "PO-20260824-ABC123",
@@ -62,9 +75,35 @@ function buildContext(
   };
 }
 
-function buildJob(attemptsMade = 0): Job {
+/**
+ * The settlement ledger the worker reads. `invoice` is what this invoice has
+ * already taken, `purchaseOrder` what the whole order has — the two aggregate
+ * calls the worker makes, in that order, and again inside the claim.
+ */
+function mockLedger(settled: { invoice?: number; purchaseOrder?: number } = {}): void {
+  db.payment.aggregate.mockImplementation(
+    (args: { where: { invoiceId?: string; settlementKey?: unknown } }) => {
+      const base = args.where.invoiceId
+        ? (settled.invoice ?? 0)
+        : (settled.purchaseOrder ?? settled.invoice ?? 0);
+
+      // Once the provider has been charged, this tranche counts as settled too.
+      // That is exactly what decides whether the invoice lands on PAID or on
+      // PARTIALLY_PAID, so the fake ledger has to move with it.
+      const justCharged =
+        charge.mock.calls.length > 0 && args.where.invoiceId && !args.where.settlementKey
+          ? ((charge.mock.calls.at(-1)?.[0] as { amountPaise: number } | undefined)?.amountPaise ??
+            0)
+          : 0;
+
+      return Promise.resolve({ _sum: { amountPaise: base + justCharged } });
+    },
+  );
+}
+
+function buildJob(attemptsMade = 0, data: Record<string, unknown> = {}): Job {
   return {
-    data: { invoiceId: INVOICE, organizationId: ORG },
+    data: { invoiceId: INVOICE, organizationId: ORG, settlementKey: AUTO, ...data },
     attemptsMade,
     opts: { attempts: 3 },
   } as unknown as Job;
@@ -102,9 +141,12 @@ beforeEach(() => {
   vi.clearAllMocks();
   db.invoice.updateMany.mockResolvedValue({ count: 1 });
   db.payment.create.mockResolvedValue({ id: "pay-1" });
+  db.$queryRaw.mockResolvedValue([{ id: "po-1" }]);
   db.payment.updateMany.mockResolvedValue({ count: 1 });
-  // No sibling invoice has taken this purchase order's money, unless a test says so.
+  // Nothing has been settled against this invoice or its order, unless a test
+  // says so.
   db.payment.count.mockResolvedValue(0);
+  mockLedger();
   db.exception.upsert.mockResolvedValue({ id: "exc-1" });
   db.exception.findUnique.mockResolvedValue(null);
   db.exception.count.mockResolvedValue(0);
@@ -118,12 +160,17 @@ describe("processPaymentJob — success", () => {
 
     const result = await processPaymentJob(buildJob());
 
-    expect(result).toEqual({ invoiceId: INVOICE, status: "COMPLETED" });
+    expect(result).toEqual({
+      invoiceId: INVOICE,
+      settlementKey: AUTO,
+      status: "COMPLETED",
+      amountPaise: INVOICE_TOTAL_PAISE,
+    });
 
     expect(charge).toHaveBeenCalledTimes(1);
     expect(charge).toHaveBeenCalledWith({
-      idempotencyKey: INVOICE,
-      // The purchase order's total, not the AI-transcribed invoice figure.
+      // Keyed on the tranche, so a later instalment is a distinct charge.
+      idempotencyKey: `${INVOICE}:${AUTO}`,
       amountPaise: PO_TOTAL_PAISE,
       currency: "INR",
       reference: "INV-2026-0042",
@@ -144,7 +191,13 @@ describe("processPaymentJob — success", () => {
     expect(settle.data).toMatchObject({ status: "COMPLETED", providerReference: "SIM-ABC123" });
 
     expect(firstArg(db.invoice.updateMany)).toMatchObject({
-      where: { id: INVOICE, organizationId: ORG, status: "APPROVED" },
+      // PARTIALLY_PAID is accepted too: an invoice settled in instalments is
+      // still the same debt, and the last tranche has to be able to close it.
+      where: {
+        id: INVOICE,
+        organizationId: ORG,
+        status: { in: ["APPROVED", "PARTIALLY_PAID"] },
+      },
       data: { status: "PAID" },
     });
 
@@ -154,7 +207,15 @@ describe("processPaymentJob — success", () => {
   it("pays a BLOCKED payment once a human has cleared the invoice", async () => {
     db.invoice.findFirst.mockResolvedValue(
       buildContext({
-        payment: { id: "pay-1", status: "BLOCKED", amountPaise: PO_TOTAL_PAISE, currency: "INR" },
+        payments: [
+          {
+            id: "pay-1",
+            settlementKey: AUTO,
+            status: "BLOCKED",
+            amountPaise: PO_TOTAL_PAISE,
+            currency: "INR",
+          },
+        ],
       }),
     );
     db.payment.create.mockRejectedValue(uniqueViolation());
@@ -174,7 +235,15 @@ describe("processPaymentJob — refusals", () => {
       buildContext({
         status: "EXCEPTION",
         matchStatus: "MISMATCHED",
-        payment: { id: "pay-1", status: "BLOCKED", amountPaise: PO_TOTAL_PAISE, currency: "INR" },
+        payments: [
+          {
+            id: "pay-1",
+            settlementKey: AUTO,
+            status: "BLOCKED",
+            amountPaise: PO_TOTAL_PAISE,
+            currency: "INR",
+          },
+        ],
       }),
     );
 
@@ -202,7 +271,15 @@ describe("processPaymentJob — refusals", () => {
     db.invoice.findFirst.mockResolvedValue(
       buildContext({
         matchStatus: "MISMATCHED",
-        payment: { id: "pay-1", status: "PENDING", amountPaise: PO_TOTAL_PAISE, currency: "INR" },
+        payments: [
+          {
+            id: "pay-1",
+            settlementKey: AUTO,
+            status: "PENDING",
+            amountPaise: PO_TOTAL_PAISE,
+            currency: "INR",
+          },
+        ],
       }),
     );
     db.payment.create.mockRejectedValue(uniqueViolation());
@@ -231,7 +308,15 @@ describe("processPaymentJob — refusals", () => {
     db.invoice.findFirst.mockResolvedValue(
       buildContext({
         status: "PAID",
-        payment: { id: "pay-1", status: "COMPLETED", amountPaise: PO_TOTAL_PAISE, currency: "INR" },
+        payments: [
+          {
+            id: "pay-1",
+            settlementKey: AUTO,
+            status: "COMPLETED",
+            amountPaise: PO_TOTAL_PAISE,
+            currency: "INR",
+          },
+        ],
       }),
     );
 
@@ -239,6 +324,7 @@ describe("processPaymentJob — refusals", () => {
 
     expect(result).toEqual({
       invoiceId: INVOICE,
+      settlementKey: AUTO,
       status: "COMPLETED",
       skippedReason: "Invoice is already paid",
     });
@@ -250,7 +336,15 @@ describe("processPaymentJob — refusals", () => {
   it("refuses a completed payment even if the invoice status lags behind", async () => {
     db.invoice.findFirst.mockResolvedValue(
       buildContext({
-        payment: { id: "pay-1", status: "COMPLETED", amountPaise: PO_TOTAL_PAISE, currency: "INR" },
+        payments: [
+          {
+            id: "pay-1",
+            settlementKey: AUTO,
+            status: "COMPLETED",
+            amountPaise: PO_TOTAL_PAISE,
+            currency: "INR",
+          },
+        ],
       }),
     );
 
@@ -366,6 +460,7 @@ describe("processPaymentJob — provider failures", () => {
 
     expect(result).toEqual({
       invoiceId: INVOICE,
+      settlementKey: AUTO,
       status: "FAILED",
       skippedReason: "gateway timeout",
     });
@@ -395,37 +490,42 @@ describe("processPaymentJob — provider failures", () => {
   });
 });
 
-describe("processPaymentJob — one purchase order, one payment", () => {
+describe("processPaymentJob — the purchase order caps what can be paid", () => {
   beforeEach(() => {
     db.invoice.findFirst.mockResolvedValue(buildContext());
-    // A different invoice against the same purchase order already has the money.
-    db.payment.count.mockResolvedValue(1);
+    // A different invoice against the same purchase order already took the
+    // whole committed amount, so nothing is left to pay this one from.
+    mockLedger({ invoice: 0, purchaseOrder: PO_TOTAL_PAISE });
   });
 
-  it("refuses a second invoice once its purchase order has already been paid", async () => {
+  it("refuses a second invoice once its purchase order is settled in full", async () => {
     const result = await processPaymentJob(buildJob());
 
     expect(charge).not.toHaveBeenCalled();
     expect(db.payment.create).not.toHaveBeenCalled();
     expect(result.skippedReason).toBe(
-      "Another invoice against this purchase order has already been paid",
+      "The purchase order is already settled in full; nothing is left to pay",
     );
   });
 
-  it("counts only sibling invoices whose payment holds or has taken the money", async () => {
+  it("counts only tranches that hold or have taken the money", async () => {
     await processPaymentJob(buildJob());
 
-    expect(firstArg(db.payment.count)).toMatchObject({
-      where: {
-        organizationId: ORG,
-        purchaseOrderId: "po-1",
-        invoiceId: { not: INVOICE },
-        status: { in: ["PROCESSING", "COMPLETED"] },
-      },
+    const orderQuery = db.payment.aggregate.mock.calls
+      .map((call) => call[0] as { where: Record<string, unknown> })
+      .find((call) => call.where.purchaseOrderId !== undefined);
+
+    expect(orderQuery?.where).toMatchObject({
+      organizationId: ORG,
+      purchaseOrderId: "po-1",
+      status: { in: ["PROCESSING", "COMPLETED"] },
     });
   });
 
   it("raises a DUPLICATE_INVOICE exception so the second document is visible", async () => {
+    // A different invoice took the money — that is what makes this a duplicate.
+    db.payment.count.mockResolvedValue(1);
+
     await processPaymentJob(buildJob());
 
     expect(firstArg(db.exception.upsert)).toMatchObject({
@@ -437,6 +537,21 @@ describe("processPaymentJob — one purchase order, one payment", () => {
         },
       },
     });
+    expect(firstArg(db.payment.count)).toMatchObject({
+      where: { purchaseOrderId: "po-1", invoiceId: { not: INVOICE } },
+    });
+  });
+
+  // The false alarm this guard prevents: an order spent by this invoice's own
+  // tranches is an ordinary settled invoice, not a second document. Raising a
+  // CRITICAL exception on it — and blocking its remaining rows — would flag the
+  // very invoice that was correctly paid.
+  it("stays quiet when the order was spent by this invoice's own tranches", async () => {
+    db.payment.count.mockResolvedValue(0);
+
+    await processPaymentJob(buildJob());
+
+    expect(db.exception.upsert).not.toHaveBeenCalled();
   });
 
   it("does not raise the exception for an invoice that was never approved", async () => {
@@ -445,6 +560,95 @@ describe("processPaymentJob — one purchase order, one payment", () => {
     await processPaymentJob(buildJob());
 
     expect(db.exception.upsert).not.toHaveBeenCalled();
+  });
+
+  // The point of the cap over the old "one payment per order" rule: an order
+  // that is only *partly* spent still has room for a second document.
+  it("pays a second invoice down to whatever the order has left", async () => {
+    mockLedger({ invoice: 0, purchaseOrder: PO_TOTAL_PAISE - 1_000_000 });
+
+    const result = await processPaymentJob(buildJob());
+
+    expect(result.amountPaise).toBe(1_000_000);
+    expect(charge).toHaveBeenCalledWith(expect.objectContaining({ amountPaise: 1_000_000 }));
+  });
+});
+
+describe("processPaymentJob — partial settlement", () => {
+  it("settles only the amount a human approved and leaves the invoice PARTIALLY_PAID", async () => {
+    db.invoice.findFirst.mockResolvedValue(buildContext({ matchStatus: "MISMATCHED" }));
+
+    const job = buildJob(0, {
+      settlementKey: "exc-1",
+      amountPaise: 20_616_960,
+      authorization: { exceptionId: "exc-1", userId: "dev-user", reason: "96 of 100 accepted" },
+    });
+
+    const result = await processPaymentJob(job);
+
+    expect(result).toEqual({
+      invoiceId: INVOICE,
+      settlementKey: "exc-1",
+      status: "COMPLETED",
+      amountPaise: 20_616_960,
+    });
+
+    expect(charge).toHaveBeenCalledWith(
+      expect.objectContaining({
+        idempotencyKey: `${INVOICE}:exc-1`,
+        amountPaise: 20_616_960,
+      }),
+    );
+
+    const claim = firstArg(db.payment.create) as {
+      data: {
+        settlementKey: string;
+        kind: string;
+        amountPaise: number;
+        authorizedBy: string;
+        authorizationReason: string;
+        authorizingExceptionId: string;
+      };
+    };
+    expect(claim.data).toMatchObject({
+      settlementKey: "exc-1",
+      kind: "PARTIAL",
+      amountPaise: 20_616_960,
+      authorizedBy: "dev-user",
+      authorizationReason: "96 of 100 accepted",
+      authorizingExceptionId: "exc-1",
+    });
+
+    // Short of the invoice total, so the debt is not discharged.
+    const statuses = db.invoice.updateMany.mock.calls.map(
+      (call) => (call[0] as { data: { status: string } }).data.status,
+    );
+    expect(statuses).toContain("PARTIALLY_PAID");
+  });
+
+  it("settles the balance of a PARTIALLY_PAID invoice and marks it PAID", async () => {
+    db.invoice.findFirst.mockResolvedValue(buildContext({ status: "PARTIALLY_PAID" }));
+    mockLedger({ invoice: 20_616_960, purchaseOrder: 20_616_960 });
+
+    const result = await processPaymentJob(buildJob(0, { settlementKey: "exc-2" }));
+
+    expect(result.amountPaise).toBe(INVOICE_TOTAL_PAISE - 20_616_960);
+
+    const statuses = db.invoice.updateMany.mock.calls.map(
+      (call) => (call[0] as { data: { status: string } }).data.status,
+    );
+    expect(statuses).toContain("PAID");
+  });
+
+  it("refuses an approved amount larger than the invoice still owes", async () => {
+    db.invoice.findFirst.mockResolvedValue(buildContext());
+
+    const result = await processPaymentJob(
+      buildJob(0, { settlementKey: "exc-3", amountPaise: PO_TOTAL_PAISE + 1 }),
+    );
+
+    expect(charge).not.toHaveBeenCalled();
+    expect(result.skippedReason).toContain("exceeds the invoice's outstanding balance");
   });
 });
 
