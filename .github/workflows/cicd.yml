@@ -1,0 +1,115 @@
+name: Continuous Deployment
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Two deploys racing on one EC2 box would fight over the container names.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/p2p-backend:latest
+
+jobs:
+  build:
+    name: Build and push image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}
+          # pnpm install + tsc is the slow part; cache it between deploys.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Pull image
+        run: docker pull "$IMAGE"
+
+      - name: Stop old containers
+        run: |
+          docker stop p2p-api p2p-worker || true
+          docker rm p2p-api p2p-worker || true
+
+      - name: Write env file
+        run: |
+          umask 077
+          cat > "$RUNNER_TEMP/p2p.env" <<EOF
+          NODE_ENV=production
+          PORT=4000
+          DATABASE_URL=${{ secrets.DATABASE_URL }}
+          DIRECT_DATABASE_URL=${{ secrets.DIRECT_DATABASE_URL }}
+          REDIS_URL=${{ secrets.REDIS_URL }}
+          GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+          CLOUDINARY_CLOUD_NAME=${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY=${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET=${{ secrets.CLOUDINARY_API_SECRET }}
+          TRUST_PROXY_HOPS=1
+          EOF
+
+      - name: Run API container
+        run: |
+          docker run -d \
+            --name p2p-api \
+            --restart unless-stopped \
+            -p 127.0.0.1:4000:4000 \
+            --env-file "$RUNNER_TEMP/p2p.env" \
+            "$IMAGE"
+
+      - name: Run worker container
+        run: |
+          docker run -d \
+            --name p2p-worker \
+            --restart unless-stopped \
+            --no-healthcheck \
+            --env-file "$RUNNER_TEMP/p2p.env" \
+            "$IMAGE" \
+            node dist/workers/index.js
+
+      - name: Remove env file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/p2p.env"
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4000/health > /dev/null; then
+              echo "API is up."
+              curl -sS http://127.0.0.1:4000/ready || true
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "API did not become healthy. Logs:"
+          docker logs --tail 100 p2p-api
+          exit 1
+
+      - name: Show worker logs
+        if: always()
+        run: docker logs --tail 30 p2p-worker || true
+
+      - name: Prune old images
+        if: always()
+        run: docker image prune -af
